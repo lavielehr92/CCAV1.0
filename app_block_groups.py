@@ -77,19 +77,24 @@ def load_block_group_data():
         # Try to load the block group data
         gdf = gpd.read_file('philadelphia_block_groups.geojson')
         demographics = pd.read_csv('demographics_block_groups.csv')
-        
-        # FIX: Ensure GEOID formats match for proper merging
-        # Both should be strings without decimal points
+
+        # Retain only identifiers + geometry from GeoJSON to avoid duplicate attribute columns
+    keep_cols = [col for col in ['GEOID', 'geometry'] if col in gdf.columns]
+        gdf = gdf[keep_cols].copy()
+
+        # Ensure GEOID formats match for proper merging
         gdf['GEOID'] = gdf['GEOID'].astype(str)
         demographics['block_group_id'] = demographics['block_group_id'].astype(str)
-        
-        # CRITICAL: Clean Census sentinel values BEFORE any calculations
-        # Census uses -666666666 to indicate "no data available"
-        sentinel_cols = ['income', 'poverty_rate', 'total_pop', 'pct_black', 'pct_white', 'hh_with_u18']
+
+        # Clean Census sentinel values BEFORE any calculations
+        sentinel_cols = ['income', 'poverty_rate', 'total_pop', 'pct_black', 'pct_white', 'hh_with_u18', '%Christian', '%first_gen']
         for col in sentinel_cols:
             if col in demographics.columns:
                 demographics[col] = demographics[col].replace(-666666666, pd.NA)
                 demographics[col] = pd.to_numeric(demographics[col], errors='coerce')
+
+        if 'TRACTCE' in demographics.columns:
+            demographics['TRACTCE'] = demographics['TRACTCE'].astype(str)
         
         return gdf, demographics
     except Exception as e:
@@ -167,18 +172,27 @@ def create_choropleth_map(gdf_filtered, demographics_filtered, color_column, tit
     
     # Prepare custom data for hover with proper formatting
     cleaned = plot_data.copy()
-    
-    # Clean sentinel values
-    sentinel_cols = ['income', 'poverty_rate', 'pct_black', 'pct_white', '%first_gen', '%Christian']
-    for col in sentinel_cols:
+
+    numeric_cols = ['income', 'poverty_rate', 'total_pop', 'hh_with_u18', '%first_gen', '%Christian', 'k12_pop', color_column]
+    for col in numeric_cols:
         if col in cleaned.columns:
             cleaned[col] = cleaned[col].replace(-666666666, np.nan)
             cleaned[col] = pd.to_numeric(cleaned[col], errors='coerce')
-    
-    # Ensure color column sentinel removed
-    if color_column in cleaned.columns:
-        cleaned[color_column] = cleaned[color_column].replace(-666666666, np.nan)
-    
+
+    z_series = cleaned[color_column] if color_column in cleaned.columns else pd.Series(np.nan, index=cleaned.index)
+    if z_series.isna().all():
+        fallback_col = 'k12_pop' if 'k12_pop' in cleaned.columns else None
+        if fallback_col:
+            st.warning(f"No valid values in '{color_column}' to color by; falling back to '{fallback_col}'.")
+            color_column = fallback_col
+            if color_column in cleaned.columns:
+                z_series = pd.to_numeric(cleaned[color_column], errors='coerce')
+        else:
+            st.error("No valid data available for coloring the map.")
+            return go.Figure()
+
+    z_vals = z_series.fillna(0).astype(float).values
+
     # Helper function to format values for display
     def format_value(row, col, format_type='number'):
         """Format value for hover display, showing 'N/A' for missing data"""
@@ -193,10 +207,21 @@ def create_choropleth_map(gdf_filtered, demographics_filtered, color_column, tit
             return f'{int(val):,}'
         else:
             return f'{val:.1f}'
-    
+
+    def metric_format(col_name: str) -> str:
+        if col_name == 'EDI':
+            return 'number'
+        if col_name == 'income':
+            return 'currency'
+        if 'rate' in col_name or 'pct' in col_name or col_name.endswith('%'):
+            return 'percent'
+        if col_name in ['%first_gen', '%Christian']:
+            return 'percent'
+        return 'integer'
+
     # Create formatted customdata
     customdata_list = []
-    for idx, row in cleaned.iterrows():
+    for _, row in cleaned.iterrows():
         customdata_list.append([
             str(row.get('block_group_id', 'N/A')),
             str(row.get('TRACTCE', 'N/A')),
@@ -207,23 +232,10 @@ def create_choropleth_map(gdf_filtered, demographics_filtered, color_column, tit
             format_value(row, 'hh_with_u18', 'integer'),
             format_value(row, '%first_gen', 'percent'),
             format_value(row, '%Christian', 'percent'),
-            format_value(row, color_column, 'number' if color_column == 'EDI' else 'integer')
+            format_value(row, color_column, metric_format(color_column))
         ])
-    
+
     customdata = np.array(customdata_list)
-    
-    # Get z values for coloring
-    z_vals = cleaned[color_column].values if color_column in cleaned.columns else plot_data[color_column].values
-    # Fallback if all-NaN z values
-    if np.all(np.isnan(z_vals)):
-        fallback_col = 'k12_pop' if 'k12_pop' in cleaned.columns else None
-        if fallback_col:
-            st.warning(f"No valid values in '{color_column}' to color by; falling back to '{fallback_col}'.")
-            color_column = fallback_col
-            z_vals = safe_arr(color_column)
-        else:
-            st.error("No valid data available for coloring the map.")
-            return go.Figure()
     
     # Create the choropleth using graph_objects for better control
     fig = go.Figure()
@@ -681,6 +693,20 @@ def main():
                     help="Block groups with marketing priority ≥6"
                 )
         
+        with st.expander("How the Educational Desert Index (EDI) is calculated", expanded=False):
+            st.markdown(
+                """
+                **Four inputs (each scaled 0-1) feed the composite score:**
+
+                1. **Supply vs. Demand (30%)** – Two-Step Floating Catchment Analysis compares local K-12 student demand to available CCA or partner seats. Higher student-to-seat ratios increase EDI.
+                2. **Gravity-Based Access (25%)** – Nearer campuses receive higher weights using an exponential distance decay. Areas far from any campus score higher (worse).
+                3. **Nearest Campus Distance (25%)** – The straight-line distance (km) to the closest CCA campus. Longer travel distances raise EDI.
+                4. **Neighborhood Need (20%)** – Combines poverty rate (70%) and adults without a high school diploma (30%). Higher need lifts EDI.
+
+                The components are blended and re-scaled to a 0–100 range. Higher EDI values indicate stronger Educational Desert conditions (high need + low access).
+                """
+            )
+
         # Main map
         st.subheader(f"📍 {selected_metric} by Block Group")
         

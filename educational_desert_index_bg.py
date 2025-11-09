@@ -161,23 +161,29 @@ def compute_edi_block_groups(demographics_df, schools_df, max_distance_km=15):
     edi_df = pd.DataFrame(results)
     
     # Normalize components to 0-1 scale
-    scaler = MinMaxScaler()
-    
-    # Safe normalization function that handles all-NaN or single-value columns
     def safe_normalize(df, column, inverse=False):
         """Normalize a column, handling edge cases"""
-        values = df[[column]].copy()
-        # Check if all values are the same or all NaN
-        if pd.isna(values).all().all():
+        series = pd.to_numeric(df[column], errors='coerce')
+        mask = series.notna()
+
+        if not mask.any():
             return np.zeros(len(df))
-        unique_vals = values.dropna().nunique()
+
+        unique_vals = series[mask].nunique()
         if unique_vals <= 1:
             return np.ones(len(df)) * 0.5  # Middle value if all same
+
+        scaler_local = MinMaxScaler()
+        scaled = np.zeros(len(df), dtype=float)
+        scaled[:] = 0.5  # Default for missing values
+
         try:
-            normalized = scaler.fit_transform(values).flatten()
-            return (1 - normalized) if inverse else normalized
+            normalized = scaler_local.fit_transform(series[mask].to_frame()).flatten()
+            scaled[mask] = normalized
         except Exception:
             return np.ones(len(df)) * 0.5
+
+        return (1 - scaled) if inverse else scaled
     
     # For accessibility measures, higher is better (inverse for EDI)
     edi_df['access_2sfca_norm'] = safe_normalize(edi_df, 'accessibility_2sfca', inverse=True)
@@ -207,7 +213,7 @@ def compute_edi_block_groups(demographics_df, schools_df, max_distance_km=15):
     
     # Scale final EDI to 0-100 for interpretability
     try:
-        edi_df['EDI'] = scaler.fit_transform(edi_df[['EDI_raw']]).flatten() * 100
+        edi_df['EDI'] = MinMaxScaler().fit_transform(edi_df[['EDI_raw']]).flatten() * 100
     except Exception:
         # If scaling fails, use raw values scaled manually
         edi_raw = edi_df['EDI_raw'].values
