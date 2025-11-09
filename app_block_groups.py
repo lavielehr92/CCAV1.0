@@ -5,13 +5,15 @@ CCA Expansion Analysis Dashboard with Choropleth Visualization
 
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import geopandas as gpd
 import json
 import os
 from educational_desert_index_bg import compute_edi_block_groups, haversine_km
 import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from competition_ingest import load_competition_schools
+from school_ingest import load_census_schools
 try:
     # Allow optional live refresh import
     from fetch_block_groups_live import main as fetch_live_block_groups
@@ -70,6 +72,42 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
+def compute_hpfi_scores(df: pd.DataFrame, edi_col: str = "EDI") -> pd.DataFrame:
+    """Attach High-Potential Family Index (0-1) to the provided DataFrame."""
+
+    def normalise(series: pd.Series) -> pd.Series:
+        series = pd.to_numeric(series, errors="coerce")
+        if series.nunique(dropna=True) <= 1:
+            return pd.Series(0.5, index=series.index)
+        scaled = MinMaxScaler().fit_transform(series.to_frame()).flatten()
+        return pd.Series(scaled, index=series.index)
+
+    working = df.copy()
+    income_norm = normalise(working.get("income"))
+    first_gen_norm = normalise(working.get("first_gen_pct", working.get("%first_gen")))
+    k12_norm = normalise(working.get("k12_pop"))
+
+    edi_values = pd.to_numeric(working.get(edi_col), errors="coerce").fillna(0.0)
+    inverse_edi = 1.0 - (edi_values / 100.0).clip(lower=0.0, upper=1.0)
+
+    weights = {
+        "income": 0.40,
+        "first_gen": 0.30,
+        "k12": 0.20,
+        "inverse_edi": 0.10,
+    }
+
+    hpfi = (
+        weights["income"] * income_norm +
+        weights["first_gen"] * first_gen_norm +
+        weights["k12"] * k12_norm +
+        weights["inverse_edi"] * inverse_edi
+    )
+
+    working["hpfi"] = hpfi.clip(0.0, 1.0)
+    return working
+
 @st.cache_data(ttl=3600)  # Cache for 1 hour, then reload
 def load_block_group_data():
     """Load and cache block group data"""
@@ -103,17 +141,24 @@ def load_block_group_data():
         st.stop()
 
 @st.cache_data  
-def load_other_data():
-    """Load schools and student data"""
+def load_current_students():
+    """Load current student overlay data."""
     try:
-        schools = pd.read_csv('schools.csv')
-        current_students = pd.read_csv('current_students.csv')
-        return schools, current_students
+        return pd.read_csv('current_students.csv')
     except Exception as e:
-        st.error(f"Error loading supporting data: {e}")
-        return pd.DataFrame(), pd.DataFrame()
+        st.error(f"Error loading student overlay data: {e}")
+        return pd.DataFrame()
 
-def create_choropleth_map(gdf_filtered, demographics_filtered, color_column, title, show_students=False, students_df=None):
+def create_choropleth_map(
+    gdf_filtered,
+    demographics_filtered,
+    color_column,
+    title,
+    show_students=False,
+    students_df=None,
+    show_competition=False,
+    competition_df=None
+):
     """Create choropleth map with block group boundaries"""
     
     # Debug output
@@ -337,6 +382,42 @@ def create_choropleth_map(gdf_filtered, demographics_filtered, color_column, tit
                          'Lat: %{lat:.4f}<br>' +
                          'Lon: %{lon:.4f}<extra></extra>'
         )
+
+    if show_competition and competition_df is not None and not competition_df.empty:
+        palette = {
+            'Catholic': '#8E0000',
+            'Charter': '#1F77B4',
+            'Private': '#7851A9',
+            'Christian': '#FF7F0E',
+            'CCA Campus': '#FFD700',
+            'Other': '#2CA02C'
+        }
+        comp_copy = competition_df.copy()
+        comp_copy['type'] = comp_copy['type'].fillna('Other')
+        comp_copy['color'] = comp_copy['type'].map(lambda t: palette.get(t, '#2CA02C'))
+        hover_cols = ['school_name', 'type', 'grades', 'notable_info', 'address']
+        custom_comp = comp_copy[hover_cols].fillna('').to_numpy()
+
+        fig.add_scattermapbox(
+            lat=comp_copy['lat'],
+            lon=comp_copy['lon'],
+            mode='markers',
+            marker=dict(
+                size=10,
+                symbol='diamond',
+                color=comp_copy['color'],
+                line=dict(width=1, color='white')
+            ),
+            customdata=custom_comp,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Type: %{customdata[1]}<br>"
+                "Grades: %{customdata[2]}<br>"
+                "%{customdata[3]}<br>"
+                "Address: %{customdata[4]}<extra></extra>"
+            ),
+            name='Competition Schools'
+        )
     
     return fig
 
@@ -440,9 +521,41 @@ def main():
     # Load data
     with st.spinner("Loading Census block group data..."):
         gdf, demographics = load_block_group_data()
-        schools, current_students = load_other_data()
+        current_students = load_current_students()
+
+    try:
+        competition_schools = load_competition_schools()
+    except RuntimeError as exc:
+        st.error(f"Unable to load competition schools: {exc}")
+        competition_schools = pd.DataFrame()
+
+    try:
+        census_schools = load_census_schools()
+    except RuntimeError as exc:
+        st.error(f"Unable to load Census school landmarks: {exc}")
+        census_schools = pd.DataFrame()
     
-    st.success(f"✅ Loaded {len(gdf)} block groups and {len(schools)} schools")
+    st.success(f"✅ Loaded {len(gdf)} block groups, {len(census_schools)} Census schools, and {len(competition_schools)} competitor campuses")
+
+    if not competition_schools.empty:
+        if 'type' not in competition_schools.columns:
+            competition_schools['type'] = 'Other'
+        else:
+            competition_schools['type'] = competition_schools['type'].fillna('Other')
+        competition_schools['capacity'] = pd.to_numeric(competition_schools.get('capacity'), errors='coerce').fillna(350)
+        competition_schools['lat'] = pd.to_numeric(competition_schools.get('lat'), errors='coerce')
+        competition_schools['lon'] = pd.to_numeric(competition_schools.get('lon'), errors='coerce')
+        competition_schools = competition_schools.dropna(subset=['lat', 'lon'])
+    else:
+        competition_schools = pd.DataFrame(columns=['school_name', 'type', 'lat', 'lon', 'capacity', 'grades', 'notable_info', 'address'])
+
+    if not census_schools.empty:
+        census_schools['lat'] = pd.to_numeric(census_schools.get('lat'), errors='coerce')
+        census_schools['lon'] = pd.to_numeric(census_schools.get('lon'), errors='coerce')
+        census_schools['capacity'] = pd.to_numeric(census_schools.get('capacity'), errors='coerce').fillna(400)
+        census_schools = census_schools.dropna(subset=['lat', 'lon'])
+    else:
+        census_schools = pd.DataFrame(columns=['school_name', 'lat', 'lon', 'capacity'])
     
     # Add helpful info about the data
     with st.expander("ℹ️ About This Data", expanded=False):
@@ -503,36 +616,54 @@ def main():
                     except Exception as e:
                         st.error(f"Live fetch failed: {e}")
     
+    highlight_hpfi = False
+
     if not demographics_filtered.empty:
-        # Show income distribution but do NOT filter unless user opts in explicitly
-        st.sidebar.markdown("**Income Distribution (Median per Block Group)**")
-        valid_incomes = demographics_filtered['income'].dropna()
-        if len(valid_incomes) > 0:
-            min_income = int(valid_incomes.min())
-            max_income = int(valid_incomes.max())
-            st.sidebar.progress(0)
-            st.sidebar.write(f"Range: ${min_income:,} – ${max_income:,}")
-            enable_income_filter = st.sidebar.checkbox("Enable Median Income Filter (optional)", value=False)
-            if enable_income_filter:
-                income_range = st.sidebar.slider(
-                    "Select Median Income Range", 
-                    min_income,
-                    max_income,
-                    (min_income, max_income),
-                    step=5000,
-                    format="$%d",
-                    key="income_range"
-                )
-                demographics_filtered = demographics_filtered[
-                    (demographics_filtered['income'] >= income_range[0]) &
-                    (demographics_filtered['income'] <= income_range[1])
-                ]
-                st.sidebar.info(f"Filtered to {len(demographics_filtered)} block groups in selected median range.")
-            else:
-                st.sidebar.success(f"All {len(demographics_filtered)} block groups included (no median income filtering).")
+        st.sidebar.subheader("Marketing Target Controls")
+        income_series = pd.to_numeric(demographics_filtered['income'], errors='coerce').dropna()
+        if income_series.empty:
+            income_floor, income_ceiling = 0, 250000
         else:
-            st.sidebar.warning("⚠️ No valid income data available in filtered block groups")
-        
+            income_floor = int(income_series.min())
+            income_ceiling = int(income_series.max())
+            if income_floor == income_ceiling:
+                income_ceiling = income_floor + 1
+
+        income_range = st.sidebar.slider(
+            "Median Household Income Range",
+            min_value=income_floor,
+            max_value=income_ceiling,
+            value=(income_floor, income_ceiling),
+            step=1000,
+            format="$%d"
+        )
+        demographics_filtered = demographics_filtered[
+            demographics_filtered['income'].between(income_range[0], income_range[1], inclusive="both")
+        ]
+
+        fg_series = pd.to_numeric(demographics_filtered.get('first_gen_pct', demographics_filtered.get('%first_gen')), errors='coerce').dropna()
+        if fg_series.empty:
+            fg_min, fg_max = 0.0, 100.0
+        else:
+            fg_min = float(fg_series.min())
+            fg_max = float(fg_series.max())
+            if fg_min == fg_max:
+                fg_max = min(100.0, fg_min + 1.0)
+
+        first_gen_range = st.sidebar.slider(
+            "First-Generation % Range",
+            min_value=fg_min,
+            max_value=fg_max,
+            value=(fg_min, fg_max),
+            step=1.0
+        )
+        demographics_filtered = demographics_filtered[
+            pd.to_numeric(demographics_filtered.get('first_gen_pct', demographics_filtered.get('%first_gen')), errors='coerce')
+            .between(first_gen_range[0], first_gen_range[1], inclusive="both")
+        ]
+
+        highlight_hpfi = st.sidebar.checkbox("Highlight High-Potential Family Index (HPFI)", value=False)
+
         # Additional demographic filters (optional)
         st.sidebar.subheader("Optional Filters")
         
@@ -587,20 +718,28 @@ def main():
             else:
                 st.sidebar.warning("No valid poverty rate data available")
         
-        # Filter geodataframe to match
-        gdf_filtered = gdf[gdf['GEOID'].isin(demographics_filtered['block_group_id'])]
-        
     else:
         st.warning("No block groups found within the specified distance.")
-        gdf_filtered = gdf.iloc[0:0]  # Empty dataframe
+        demographics_filtered = demographics.iloc[0:0]
         
     # Map display options
     st.sidebar.subheader("Map Display")
     show_current_students = st.sidebar.checkbox("Show Current Students", value=False)
+    show_competition_overlay = st.sidebar.checkbox("Show Competition Schools", value=True)
+    if not competition_schools.empty:
+        type_options = sorted(competition_schools['type'].dropna().unique())
+    else:
+        type_options = []
+    selected_competition_types = st.sidebar.multiselect(
+        "Competition School Types",
+        options=type_options,
+        default=type_options
+    ) if type_options else []
     
     # Visualization selection
     color_options = {
         'Educational Desert Index': 'EDI',
+        'High-Potential Family Index (HPFI)': 'hpfi',
         'K-12 Population': 'k12_pop', 
         'Median Income': 'income',
         'Poverty Rate': 'poverty_rate',
@@ -614,14 +753,14 @@ def main():
     )
     
     # Calculate EDI if needed
-    if not demographics_filtered.empty and not schools.empty:
+    if not demographics_filtered.empty and not census_schools.empty:
         with st.spinner("Calculating Educational Desert Index..."):
             try:
                 # Only calculate EDI for block groups with actual population
                 demographics_with_pop = demographics_filtered[demographics_filtered['total_pop'] > 0].copy()
                 
                 if len(demographics_with_pop) > 0:
-                    edi_df = compute_edi_block_groups(demographics_with_pop, schools)
+                    edi_df = compute_edi_block_groups(demographics_with_pop, census_schools)
                     # Merge EDI back to all demographics (including 0-pop areas)
                     demographics_filtered = demographics_filtered.merge(
                         edi_df[['block_group_id', 'EDI']], 
@@ -649,6 +788,24 @@ def main():
         # Calculate marketing priority
         demographics_filtered = demographics_filtered.copy()
         demographics_filtered['marketing_priority'] = calculate_marketing_priority_bg(demographics_filtered, cca_campuses)
+
+    if 'first_gen_pct' not in demographics_filtered.columns and '%first_gen' in demographics_filtered.columns:
+        demographics_filtered['first_gen_pct'] = pd.to_numeric(demographics_filtered['%first_gen'], errors='coerce')
+    else:
+        demographics_filtered['first_gen_pct'] = pd.to_numeric(demographics_filtered.get('first_gen_pct'), errors='coerce')
+
+    demographics_filtered = compute_hpfi_scores(demographics_filtered, edi_col="EDI" if 'EDI' in demographics_filtered.columns else 'edi')
+
+    hpfi_threshold = None
+    if highlight_hpfi and not demographics_filtered.empty:
+        hpfi_series = demographics_filtered['hpfi'].dropna()
+        if not hpfi_series.empty:
+            hpfi_threshold = hpfi_series.quantile(0.75)
+            demographics_filtered = demographics_filtered[demographics_filtered['hpfi'] >= hpfi_threshold]
+        else:
+            st.sidebar.warning("HPFI highlight enabled, but no calculable HPFI values were found.")
+
+    gdf_filtered = gdf[gdf['GEOID'].isin(demographics_filtered['block_group_id'])]
     
     # Main content area
     if not demographics_filtered.empty:
@@ -696,6 +853,18 @@ def main():
                     high_priority,
                     help="Block groups with marketing priority ≥6"
                 )
+
+        if 'hpfi' in demographics_filtered.columns:
+            hpfi_cols = st.columns(3)
+            hpfi_avg = demographics_filtered['hpfi'].mean()
+            hpfi_top = (demographics_filtered['hpfi'] >= 0.75).sum()
+            hpfi_max = demographics_filtered['hpfi'].max()
+            with hpfi_cols[0]:
+                st.metric("Avg HPFI", f"{hpfi_avg:.2f}", help="Average High-Potential Family Index in filtered area")
+            with hpfi_cols[1]:
+                st.metric("HPFI ≥ 0.75", int(hpfi_top), help="Count of block groups scoring in the top quartile")
+            with hpfi_cols[2]:
+                st.metric("Peak HPFI", f"{hpfi_max:.2f}")
         
         with st.expander("How the Educational Desert Index (EDI) is calculated", expanded=False):
             st.markdown(
@@ -715,13 +884,20 @@ def main():
         st.subheader(f"📍 {selected_metric} by Block Group")
         
         if color_options[selected_metric] in demographics_filtered.columns:
+            if hpfi_threshold is not None:
+                st.info(f"HPFI highlight enabled: showing block groups with HPFI ≥ {hpfi_threshold:.2f}.")
+            visible_competition = competition_schools[
+                competition_schools['type'].isin(selected_competition_types)
+            ] if selected_competition_types else pd.DataFrame()
             fig = create_choropleth_map(
                 gdf_filtered, 
                 demographics_filtered, 
                 color_options[selected_metric],
                 f"{selected_metric} across Philadelphia Block Groups",
                 show_current_students,
-                current_students if show_current_students else None
+                current_students if show_current_students else None,
+                show_competition_overlay,
+                visible_competition
             )
             st.plotly_chart(fig, width='stretch')
         else:
@@ -730,7 +906,7 @@ def main():
         # Analysis tables
         st.subheader("📊 Detailed Analysis")
         
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         
         with col1:
             st.write("**Top 10 Block Groups by Educational Desert Index**")
@@ -747,6 +923,17 @@ def main():
                     ['block_group_id', 'marketing_priority', 'k12_pop', 'income']
                 ]
                 st.dataframe(top_marketing, width='stretch')
+
+        with col3:
+            st.write("**Top 10 Block Groups by HPFI**")
+            if 'hpfi' in demographics_filtered.columns:
+                top_hpfi = demographics_filtered.nlargest(10, 'hpfi')[
+                    ['block_group_id', 'hpfi', 'income', 'first_gen_pct', 'k12_pop']
+                ].copy()
+                top_hpfi['hpfi'] = top_hpfi['hpfi'].map(lambda v: f"{v:.2f}")
+                top_hpfi['income'] = top_hpfi['income'].map(lambda v: f"${v:,.0f}")
+                top_hpfi['first_gen_pct'] = top_hpfi['first_gen_pct'].map(lambda v: f"{v:.1f}%")
+                st.dataframe(top_hpfi, width='stretch')
         
         # Export option
         st.subheader("📥 Export Data")
@@ -761,6 +948,8 @@ def main():
     
     else:
         st.warning("🔍 No block groups match your current filters. Try expanding your criteria.")
+        if highlight_hpfi:
+            st.info("HPFI highlight removed all visible block groups. Disable the highlight toggle to review the full list.")
         
         # Show available ranges
         if not demographics.empty:

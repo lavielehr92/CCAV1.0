@@ -1,11 +1,15 @@
 school_name,type,tuition,rating,lat,lon,capacity
-Cornerstone Christian Academy (58th St Campus),private,8000,4.5,39.9386,-75.2312,300
-Cornerstone Christian Academy (Baltimore Ave Campus),private,8000,4.5,39.9508,-75.2085,300
-St. Thomas Aquinas School,private,5000,4.0,39.9267,-75.1783,250
-St. Francis de Sales School,private,4500,3.8,39.9528,-75.2097,200
-The City School,private,6000,4.2,39.9656,-75.1433,400
-Philadelphia Christian Academy,private,5500,3.9,40.0186,-75.1433,350
-Friends Select School,private,40000,4.8,39.9526,-75.1652,500
-Springside Chestnut Hill Academy,private,42000,4.7,40.0789,-75.2078,450
-Science Leadership Academy,charter,0,4.5,39.9528,-75.1655,600
-Central High School,public,0,4.2,39.9526,-75.1652,800
+St. Barnabas Catholic School,Catholic,,,39.9224727236,-75.2267601784,350
+St. Thomas Aquinas Catholic School,Catholic,,,39.9308190870,-75.1747920181,350
+St. Francis de Sales School,Catholic,,,39.9475436035,-75.2157383634,350
+St. Peter's School,Private,,,39.9425317461,-75.1477049922,350
+Greene Towne Montessori School,Private,,,39.9560351270,-75.1758171938,200
+Harrity Elementary – Mastery Schools,Charter,,,39.9483885376,-75.2355659300,600
+Independence Charter School,Charter,,,39.9450056913,-75.1686250143,600
+Christopher Columbus Charter School,Charter,,,39.9344774333,-75.1653762393,600
+Russell Byers Charter School,Charter,,,39.9554779762,-75.1713494013,600
+The Philadelphia School,Private,,,39.9467646783,-75.1817040087,350
+Holy Child Academy,Private,,,39.9483504575,-75.2938124280,350
+Friends Select School,Private,,,39.9559464342,-75.1679194775,600
+Philadelphia Free School,Private,,,39.9444481051,-75.2186588734,200
+The City School,Christian,,,39.9714569367,-75.1761936178,350
