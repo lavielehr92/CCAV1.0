@@ -401,6 +401,19 @@ def main():
     
     st.success(f"✅ Loaded {len(gdf)} block groups and {len(schools)} schools")
     
+    # Add helpful info about the data
+    with st.expander("ℹ️ About This Data", expanded=False):
+        st.write(f"""
+        **Philadelphia Block Group Data:**
+        - Total block groups: {len(demographics):,}
+        - Total K-12 population: {demographics['k12_pop'].sum():,.0f}
+        - Block groups with students: {(demographics['k12_pop'] > 0).sum():,}
+        - Non-residential areas (0 pop): {(demographics['total_pop'] == 0).sum():,}
+        
+        **Note:** Many block groups have 0 K-12 students because they are parks, commercial zones, 
+        industrial areas, or retirement communities. Use the "Optional Filters" to hide these areas.
+        """)
+    
     # Sidebar filters
     st.sidebar.header("🎛️ Analysis Controls")
     
@@ -514,17 +527,22 @@ def main():
         # Poverty rate filter
         apply_poverty_filter = st.sidebar.checkbox("Filter by Poverty Rate", value=False)
         if apply_poverty_filter:
-            poverty_range = st.sidebar.slider(
-                "Poverty Rate Range (%)", 
-                float(demographics_filtered['poverty_rate'].min()), 
-                float(demographics_filtered['poverty_rate'].max()), 
-                (float(demographics_filtered['poverty_rate'].min()), float(demographics_filtered['poverty_rate'].max())),
-                step=1.0
-            )
-            demographics_filtered = demographics_filtered[
-                (demographics_filtered['poverty_rate'] >= poverty_range[0]) &
-                (demographics_filtered['poverty_rate'] <= poverty_range[1])
-            ]
+            # Get valid poverty rates (exclude NaN values)
+            valid_poverty = demographics_filtered['poverty_rate'].dropna()
+            if len(valid_poverty) > 0:
+                poverty_range = st.sidebar.slider(
+                    "Poverty Rate Range (%)", 
+                    float(valid_poverty.min()), 
+                    float(valid_poverty.max()), 
+                    (float(valid_poverty.min()), float(valid_poverty.max())),
+                    step=1.0
+                )
+                demographics_filtered = demographics_filtered[
+                    (demographics_filtered['poverty_rate'] >= poverty_range[0]) &
+                    (demographics_filtered['poverty_rate'] <= poverty_range[1])
+                ]
+            else:
+                st.sidebar.warning("No valid poverty rate data available")
         
         # Filter geodataframe to match
         gdf_filtered = gdf[gdf['GEOID'].isin(demographics_filtered['block_group_id'])]
