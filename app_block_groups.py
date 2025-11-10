@@ -9,6 +9,8 @@ import plotly.graph_objects as go
 import geopandas as gpd
 import json
 import os
+import requests
+from typing import Tuple
 from educational_desert_index_bg import compute_edi_block_groups, haversine_km
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
@@ -52,6 +54,18 @@ try:
 except Exception:
     fetch_live_block_groups = None
 
+STATE_FIPS = "42"  # Pennsylvania
+COUNTY_FIPS = "101"  # Philadelphia County
+ACS_YEAR = "2022"
+ACS_ACS5_ENDPOINT = f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5"
+K12_ENROLLMENT_VARS = {
+    "B14007_001E": "enrolled_total",
+    "B14007_002E": "enrolled_k",
+    "B14007_003E": "enrolled_1_4",
+    "B14007_004E": "enrolled_5_8",
+    "B14007_005E": "enrolled_9_12",
+}
+
 # Helper function to get Census API key from multiple sources
 def get_census_api_key():
     """Try to get Census API key from Streamlit secrets, env vars, or .env file"""
@@ -81,6 +95,65 @@ def get_census_api_key():
         pass
     
     return None
+
+
+@st.cache_data(ttl=86400)
+def fetch_k12_enrollment_from_census() -> Tuple[pd.DataFrame, dict]:
+    """Pull ACS B14007 enrollment counts for all Philadelphia block groups."""
+
+    params = {
+        "get": ",".join(K12_ENROLLMENT_VARS.keys()),
+        "for": "block group:*",
+        "in": f"state:{STATE_FIPS} county:{COUNTY_FIPS}",
+    }
+    api_key = get_census_api_key()
+    if api_key:
+        params["key"] = api_key
+
+    response = requests.get(ACS_ACS5_ENDPOINT, params=params, timeout=60)
+    response.raise_for_status()
+    payload = response.json()
+    headers = payload[0]
+
+    expected_columns = list(K12_ENROLLMENT_VARS.keys()) + ["state", "county", "tract", "block group"]
+    missing_columns = [col for col in expected_columns if col not in headers]
+    if missing_columns:
+        raise ValueError(
+            "Missing required ACS variables: " + ", ".join(missing_columns)
+        )
+
+    df = pd.DataFrame(payload[1:], columns=headers)
+    df["block_group_id"] = df["state"] + df["county"] + df["tract"] + df["block group"]
+
+    for code, label in K12_ENROLLMENT_VARS.items():
+        df[label] = pd.to_numeric(df[code], errors="coerce")
+
+    component_labels = [
+        K12_ENROLLMENT_VARS["B14007_002E"],
+        K12_ENROLLMENT_VARS["B14007_003E"],
+        K12_ENROLLMENT_VARS["B14007_004E"],
+        K12_ENROLLMENT_VARS["B14007_005E"],
+    ]
+    df["k12_pop_enrolled"] = df[component_labels].fillna(0).sum(axis=1)
+    df["k12_components_missing"] = df[component_labels].isna().any(axis=1)
+
+    total_k12 = float(df["k12_pop_enrolled"].sum())
+    total_blocks = len(df)
+    flagged = int(df["k12_components_missing"].sum())
+    print(
+        f"[ACS] Retrieved {total_blocks} block groups from B14007. "
+        f"Total enrolled K-12 students: {total_k12:,.0f}. "
+        f"Component gaps: {flagged}."
+    )
+
+    summary = {
+        "block_groups": total_blocks,
+        "k12_total": total_k12,
+        "component_gaps": flagged,
+    }
+
+    cols_to_return = ["block_group_id", "k12_pop_enrolled", "k12_components_missing"] + component_labels
+    return df[cols_to_return], summary
 
 # Page config
 st.set_page_config(
@@ -165,35 +238,79 @@ def compute_hpfi_scores(df: pd.DataFrame, edi_col: str = "EDI") -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)  # Cache for 1 hour, then reload
 def load_block_group_data():
-    """Load and cache block group data"""
+    """Load block group geometries and enrich demographics with ACS enrollment."""
+
     try:
-        # Try to load the block group data
         gdf = gpd.read_file('philadelphia_block_groups.geojson')
         demographics = pd.read_csv('demographics_block_groups.csv')
-
-        # Retain only identifiers + geometry from GeoJSON to avoid duplicate attribute columns
-        keep_cols = [col for col in ['GEOID', 'geometry'] if col in gdf.columns]
-        gdf = gdf[keep_cols].copy()
-
-        # Ensure GEOID formats match for proper merging
-        gdf['GEOID'] = gdf['GEOID'].astype(str)
-        demographics['block_group_id'] = demographics['block_group_id'].astype(str)
-
-        # Clean Census sentinel values BEFORE any calculations
-        sentinel_cols = ['income', 'poverty_rate', 'total_pop', 'pct_black', 'pct_white', 'hh_with_u18', '%Christian', '%first_gen']
-        for col in sentinel_cols:
-            if col in demographics.columns:
-                demographics[col] = demographics[col].replace(-666666666, pd.NA)
-                demographics[col] = pd.to_numeric(demographics[col], errors='coerce')
-
-        if 'TRACTCE' in demographics.columns:
-            demographics['TRACTCE'] = demographics['TRACTCE'].astype(str)
-        
-        return gdf, demographics
-    except Exception as e:
-        st.error(f"Error loading block group data: {e}")
+    except Exception as exc:
+        st.error(f"Error loading block group data: {exc}")
         st.info("Please run fetch_block_groups.py first to download Census block group data")
         st.stop()
+
+    keep_cols = [col for col in ['GEOID', 'geometry'] if col in gdf.columns]
+    gdf = gdf[keep_cols].copy()
+
+    gdf['GEOID'] = gdf['GEOID'].astype(str)
+    demographics['block_group_id'] = demographics['block_group_id'].astype(str)
+
+    sentinel_cols = ['income', 'poverty_rate', 'total_pop', 'pct_black', 'pct_white', 'hh_with_u18', '%Christian', '%first_gen']
+    for col in sentinel_cols:
+        if col in demographics.columns:
+            demographics[col] = demographics[col].replace(-666666666, pd.NA)
+            demographics[col] = pd.to_numeric(demographics[col], errors='coerce')
+
+    if 'TRACTCE' in demographics.columns:
+        demographics['TRACTCE'] = demographics['TRACTCE'].astype(str)
+
+    legacy_total = pd.to_numeric(demographics.get('k12_pop'), errors='coerce').sum()
+    if 'k12_pop' in demographics.columns:
+        demographics.rename(columns={'k12_pop': 'k12_pop_legacy'}, inplace=True)
+    else:
+        demographics['k12_pop_legacy'] = pd.NA
+
+    try:
+        k12_df, k12_summary = fetch_k12_enrollment_from_census()
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to retrieve ACS B14007 enrollment data. Provide a valid CENSUS_API_KEY and internet access."
+        ) from exc
+
+    demographics = demographics.merge(
+        k12_df[['block_group_id', 'k12_pop_enrolled', 'k12_components_missing']],
+        on='block_group_id',
+        how='left'
+    )
+
+    demographics['k12_imputed'] = demographics['k12_pop_enrolled'].isna() | demographics['k12_components_missing']
+    demographics['k12_pop'] = demographics['k12_pop_enrolled'].fillna(0)
+
+    negative_mask = demographics['k12_pop'] < 0
+    if negative_mask.any():
+        print(f"[QA] Resetting {negative_mask.sum()} negative K-12 values to 0.")
+        demographics.loc[negative_mask, 'k12_pop'] = 0
+        demographics.loc[negative_mask, 'k12_imputed'] = True
+
+    missing_mask = demographics['k12_pop'].isna()
+    if missing_mask.any():
+        demographics.loc[missing_mask, 'k12_pop'] = 0
+        demographics.loc[missing_mask, 'k12_imputed'] = True
+
+    demos_summary = {
+        'block_groups': len(demographics),
+        'k12_total': float(demographics['k12_pop'].sum()),
+        'legacy_k12_total': float(legacy_total) if pd.notna(legacy_total) else None,
+        'imputed_count': int(demographics['k12_imputed'].sum()),
+        'component_gaps': int(k12_summary.get('component_gaps', 0)),
+    }
+
+    print(
+        f"[QA] Block groups loaded: {demos_summary['block_groups']}. "
+        f"K-12 enrolled students: {demos_summary['k12_total']:,.0f}. "
+        f"Imputed block groups: {demos_summary['imputed_count']}."
+    )
+
+    return gdf, demographics, demos_summary
 
 @st.cache_data  
 def load_current_students():
@@ -231,6 +348,8 @@ def create_choropleth_map(
         plot_data['EDI'] = pd.to_numeric(plot_data['EDI'], errors='coerce')
     if 'hpfi' in plot_data.columns:
         plot_data['hpfi'] = pd.to_numeric(plot_data['hpfi'], errors='coerce')
+    if 'k12_pop' in plot_data.columns:
+        plot_data['k12_pop'] = pd.to_numeric(plot_data['k12_pop'], errors='coerce')
     
     st.sidebar.write(f"🔍 Debug: Merged data has {len(plot_data)} rows")
     
@@ -441,7 +560,46 @@ def create_choropleth_map(
         comp_copy = competition_df.copy()
         comp_copy['type'] = comp_copy['type'].fillna('Other')
         comp_copy['color'] = comp_copy['type'].map(lambda t: palette.get(t, '#2CA02C'))
-        hover_cols = ['school_name', 'type', 'grades', 'notable_info', 'address']
+        comp_copy['capacity'] = pd.to_numeric(comp_copy.get('capacity'), errors='coerce')
+
+        def grade_band(label: object) -> str:
+            if pd.isna(label):
+                return 'Unknown'
+            text = str(label).upper()
+            if 'K-12' in text:
+                return 'K-12'
+            if 'PK-12' in text:
+                return 'PK-12'
+            if 'PK-8' in text or 'K-8' in text:
+                return 'K-8'
+            if '9-12' in text:
+                return '9-12'
+            if '6-12' in text:
+                return '6-12'
+            return text.title()
+
+        def format_tuition(value: object) -> str:
+            if value is None or (isinstance(value, float) and np.isnan(value)):
+                return 'N/A'
+            if isinstance(value, str) and value.strip() == '':
+                return 'N/A'
+            numeric = pd.to_numeric(pd.Series([value]), errors='coerce').iloc[0]
+            if pd.isna(numeric):
+                return str(value)
+            return f"${numeric:,.0f}"
+
+        comp_copy['grade_band'] = comp_copy.get('grades').apply(grade_band) if 'grades' in comp_copy.columns else 'Unknown'
+        if 'tuition' in comp_copy.columns:
+            comp_copy['tuition_display'] = comp_copy['tuition'].apply(format_tuition)
+        else:
+            comp_copy['tuition_display'] = 'N/A'
+
+        comp_copy['capacity_display'] = comp_copy['capacity'].apply(
+            lambda v: f"{int(v):,}" if pd.notna(v) else 'n/a'
+        )
+        comp_copy['notes'] = comp_copy.get('notable_info', '').fillna('')
+
+        hover_cols = ['school_name', 'type', 'grade_band', 'tuition_display', 'capacity_display', 'address', 'notes']
         custom_comp = comp_copy[hover_cols].fillna('').to_numpy()
 
         fig.add_scattermapbox(
@@ -449,18 +607,21 @@ def create_choropleth_map(
             lon=comp_copy['lon'],
             mode='markers',
             marker=dict(
-                size=10,
+                size=18,
                 symbol='diamond',
                 color=comp_copy['color'],
-                line=dict(width=1, color='white')
+                opacity=0.95,
+                line=dict(width=2, color='#111111')
             ),
             customdata=custom_comp,
             hovertemplate=(
                 "<b>%{customdata[0]}</b><br>"
                 "Type: %{customdata[1]}<br>"
                 "Grades: %{customdata[2]}<br>"
-                "%{customdata[3]}<br>"
-                "Address: %{customdata[4]}<extra></extra>"
+                "Tuition: %{customdata[3]}<br>"
+                "Seats: %{customdata[4]}<br>"
+                "Address: %{customdata[5]}<br>"
+                "%{customdata[6]}<extra></extra>"
             ),
             name='Competition Schools'
         )
@@ -552,8 +713,29 @@ def main():
     
     # Load data
     with st.spinner("Loading Census block group data..."):
-        gdf, demographics = load_block_group_data()
+        try:
+            gdf, demographics, k12_summary = load_block_group_data()
+        except RuntimeError as exc:
+            st.error(str(exc))
+            st.stop()
         current_students = load_current_students()
+
+    total_students_loaded = k12_summary.get('k12_total', float('nan'))
+    total_block_groups_loaded = k12_summary.get('block_groups', len(demographics))
+    imputed_count = k12_summary.get('imputed_count', 0)
+    component_gaps = k12_summary.get('component_gaps', 0)
+    legacy_total = k12_summary.get('legacy_k12_total')
+
+    st.sidebar.success(
+        f"ACS B14007 enrollment: {total_students_loaded:,.0f} students across {total_block_groups_loaded} block groups"
+    )
+    st.sidebar.caption(
+        f"Imputed block groups: {imputed_count}; component gaps flagged: {component_gaps}."
+    )
+    if imputed_count:
+        st.sidebar.warning("Imputed 0 students where ACS enrollment data was missing; review k12_imputed flag in exports.")
+    if legacy_total and not np.isnan(legacy_total):
+        st.sidebar.caption(f"Legacy CSV K-12 total (pre-ACS refresh): {legacy_total:,.0f}")
 
     try:
         competition_schools = load_competition_schools()
@@ -588,6 +770,47 @@ def main():
         census_schools = census_schools.dropna(subset=['lat', 'lon'])
     else:
         census_schools = pd.DataFrame(columns=['school_name', 'lat', 'lon', 'capacity'])
+
+    public_capacity = 0.0
+    competitor_capacity = 0.0
+
+    if 'capacity' in census_schools.columns and not census_schools.empty:
+        public_capacity = pd.to_numeric(census_schools['capacity'], errors='coerce').fillna(0).sum()
+
+    if 'capacity' in competition_schools.columns and not competition_schools.empty:
+        competitor_capacity = pd.to_numeric(competition_schools['capacity'], errors='coerce').fillna(0).sum()
+
+    total_students_value = total_students_loaded if not np.isnan(total_students_loaded) else None
+    student_per_public_seat = None
+    student_per_combined_seat = None
+    if total_students_value is not None and public_capacity > 0:
+        student_per_public_seat = total_students_value / public_capacity
+    if total_students_value is not None and (public_capacity + competitor_capacity) > 0:
+        student_per_combined_seat = total_students_value / (public_capacity + competitor_capacity)
+
+    public_ratio_text = f"{student_per_public_seat:.2f}" if student_per_public_seat is not None else "n/a"
+    combined_ratio_text = f"{student_per_combined_seat:.2f}" if student_per_combined_seat is not None else "n/a"
+    print(
+        f"[Supply] Public seats: {public_capacity:,.0f}; "
+        f"Competitor seats: {competitor_capacity:,.0f}; "
+        f"Students per public seat: {public_ratio_text}; "
+        f"Students per seat (with competitors): {combined_ratio_text}"
+    )
+
+    if student_per_public_seat is not None:
+        st.sidebar.info(
+            f"Public seat coverage: {public_capacity:,.0f} seats → {student_per_public_seat:.2f} students per seat"
+        )
+    else:
+        st.sidebar.warning("Public school capacity data missing or zero; cannot compute students per seat.")
+
+    st.sidebar.caption(
+        f"Competitor seats (not in EDI unless toggled): {competitor_capacity:,.0f}"
+    )
+    if student_per_combined_seat is not None:
+        st.sidebar.caption(
+            f"Combined seats (public + competitor): {public_capacity + competitor_capacity:,.0f} → {student_per_combined_seat:.2f} students per seat"
+        )
     
     # Add helpful info about the data
     with st.expander("ℹ️ About This Data", expanded=False):
@@ -772,6 +995,43 @@ def main():
         options=type_options,
         default=type_options
     ) if type_options else []
+
+    include_competitors_in_edi = st.sidebar.checkbox(
+        "Include Competitor Schools in EDI Calculation",
+        value=False,
+        help="Adds charter and private seats to the EDI supply side."
+    )
+    if include_competitors_in_edi:
+        st.sidebar.info("EDI supply now includes competitor seats.")
+    else:
+        st.sidebar.caption("EDI supply uses only CCA/public seats.")
+
+    supply_columns = ['lat', 'lon', 'capacity']
+
+    def prepare_supply_frame(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=supply_columns)
+        prepared = df.copy()
+        for coord_col in ['lat', 'lon']:
+            if coord_col in prepared.columns:
+                prepared[coord_col] = pd.to_numeric(prepared[coord_col], errors='coerce')
+        if 'capacity' not in prepared.columns:
+            prepared['capacity'] = 0
+        prepared['capacity'] = pd.to_numeric(prepared['capacity'], errors='coerce').fillna(0)
+        prepared = prepared.dropna(subset=['lat', 'lon']) if not prepared.empty else prepared
+        return prepared[supply_columns]
+
+    census_supply = prepare_supply_frame(census_schools)
+    competitor_supply = prepare_supply_frame(competition_schools)
+
+    if include_competitors_in_edi and not competitor_supply.empty:
+        edi_supply_df = pd.concat([census_supply, competitor_supply], ignore_index=True)
+    else:
+        edi_supply_df = census_supply.copy()
+
+    print(
+        f"[EDI] Supply rows: {len(edi_supply_df)} | Competitor supply included: {include_competitors_in_edi and not competitor_supply.empty}"
+    )
     
     # Visualization selection
     color_options = {
@@ -789,13 +1049,13 @@ def main():
     
     # Calculate EDI if needed
     if not demographics_filtered.empty:
-        if not census_schools.empty:
+        if not edi_supply_df.empty:
             with st.spinner("Calculating Educational Desert Index..."):
                 try:
                     demographics_with_pop = demographics_filtered[demographics_filtered['total_pop'] > 0].copy()
 
                     if len(demographics_with_pop) > 0:
-                        edi_df = compute_edi_block_groups(demographics_with_pop, census_schools)
+                        edi_df = compute_edi_block_groups(demographics_with_pop, edi_supply_df)
                         demographics_filtered = demographics_filtered.merge(
                             edi_df[['block_group_id', 'EDI']],
                             on='block_group_id',
@@ -819,7 +1079,7 @@ def main():
                         return min(100, min_dist * 5)
                     demographics_filtered['EDI'] = demographics_filtered.apply(simple_edi, axis=1)
         else:
-            st.sidebar.info("No Census school landmarks loaded; using a distance-based EDI estimate.")
+            st.sidebar.info("No school supply data available; using a distance-based EDI estimate.")
             demographics_filtered = demographics_filtered.copy()
             def simple_edi(row):
                 if row.get('total_pop', 0) == 0:

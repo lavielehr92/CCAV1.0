@@ -40,22 +40,20 @@ ACS_YEAR = "2022"
 ACS_DATASET = f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5"
 
 # Variables to fetch
-# We'll use B01001 (Sex by Age) for more reliable age breakdowns
-# Male: 007-011 (5-17), Female: 031-035 (5-17)
+K12_ENROLLMENT_VARS: Dict[str, str] = {
+    # ACS B14007 - School Enrollment by Level of School for the Population 3 Years and Over
+    "B14007_001E": "enrolled_total",
+    "B14007_002E": "enrolled_k",
+    "B14007_003E": "enrolled_1_4",
+    "B14007_004E": "enrolled_5_8",
+    "B14007_005E": "enrolled_9_12",
+}
+
 VAR_MAP: Dict[str, str] = {
     # Income & poverty
     "B19013_001E": "median_income",
     "B17001_001E": "pop_poverty_total",
     "B17001_002E": "pop_below_poverty",
-    # K-12 age population (more reliable than B09001)
-    # Male ages 5-17
-    "B01001_007E": "male_5_9",
-    "B01001_008E": "male_10_14",
-    "B01001_009E": "male_15_17",
-    # Female ages 5-17
-    "B01001_031E": "female_5_9",
-    "B01001_032E": "female_10_14",
-    "B01001_033E": "female_15_17",
     # Total population
     "B01003_001E": "total_pop",
     # Race (selected)
@@ -64,6 +62,8 @@ VAR_MAP: Dict[str, str] = {
     # Households with children under 18
     "B11005_002E": "hh_with_u18",
 }
+
+VAR_MAP.update(K12_ENROLLMENT_VARS)
 
 
 def _get_census_key() -> str | None:
@@ -104,11 +104,17 @@ def fetch_acs_block_groups() -> pd.DataFrame:
     for code, name in VAR_MAP.items():
         df[name] = pd.to_numeric(df[code], errors="coerce")
 
-    # Derived fields - sum male and female ages 5-17
-    df["k12_pop"] = (
-        df["male_5_9"].fillna(0) + df["male_10_14"].fillna(0) + df["male_15_17"].fillna(0) +
-        df["female_5_9"].fillna(0) + df["female_10_14"].fillna(0) + df["female_15_17"].fillna(0)
-    )
+    # Derived fields - total enrolled in kindergarten through grade 12
+    enrollment_cols = [
+        "enrolled_k",
+        "enrolled_1_4",
+        "enrolled_5_8",
+        "enrolled_9_12",
+    ]
+    df["k12_pop"] = df[enrollment_cols].fillna(0).sum(axis=1)
+
+    total_k12 = df["k12_pop"].sum()
+    print(f"K-12 enrollment (B14007) across block groups: {total_k12:,.0f}")
     df["poverty_rate"] = (df["pop_below_poverty"] / df["pop_poverty_total"].replace(0, pd.NA)) * 100
     # Race percentages (if available)
     df["pct_black"] = (df["black_alone"] / df["total_pop"].replace(0, pd.NA)) * 100
@@ -172,8 +178,23 @@ def main():
     demographics = merged[[
         "block_group_id", "income", "k12_pop", "poverty_rate", "lat", "lon",
         "%Christian", "%first_gen", "total_pop", "pct_black", "pct_white", "hh_with_u18",
-        "TRACTCE"
+        "TRACTCE", "enrolled_total"
     ]].copy()
+    demographics.rename(columns={"enrolled_total": "k12_enrollment_total"}, inplace=True)
+
+    neg_mask = demographics["k12_pop"] < 0
+    if neg_mask.any():
+        print(f"Warning: Found {neg_mask.sum()} block groups with negative K-12 values. Resetting to 0.")
+        demographics.loc[neg_mask, "k12_pop"] = 0
+
+    missing_mask = demographics["k12_pop"].isna()
+    if missing_mask.any():
+        print(f"Warning: Imputing 0 for {missing_mask.sum()} block groups missing K-12 enrollment.")
+        demographics.loc[missing_mask, "k12_pop"] = 0
+    demographics["k12_imputed"] = missing_mask
+    print(
+        f"Demographics output: {len(demographics)} block groups with {int(demographics['k12_pop'].sum()):,} K-12 students."
+    )
     demographics.to_csv("demographics_block_groups.csv", index=False)
 
     print("Done. Files written:\n - philadelphia_block_groups.geojson\n - demographics_block_groups.csv")
