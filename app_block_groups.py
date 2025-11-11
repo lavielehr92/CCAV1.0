@@ -482,7 +482,6 @@ def compute_hpfi_scores(df: pd.DataFrame, edi_col: str = "EDI") -> pd.DataFrame:
         edi_series.index = working.index
 
     income_norm = normalise(working.get("income"))
-    first_gen_norm = normalise(working.get("first_gen_pct", working.get("%first_gen")))
     k12_norm = normalise(working.get("k12_pop"))
 
     # Inverse poverty as additional tuition-potential signal
@@ -493,19 +492,17 @@ def compute_hpfi_scores(df: pd.DataFrame, edi_col: str = "EDI") -> pd.DataFrame:
     edi_values = pd.to_numeric(edi_series, errors="coerce").fillna(0.0)
     inverse_edi = 1.0 - (edi_values / 100.0).clip(lower=0.0, upper=1.0)
 
-    # Updated weights prioritizing tuition-paying potential
+    # Updated weights prioritizing tuition-paying potential (NO first-gen)
     weights = {
-        "income": 0.50,           # Increased from 0.40 - primary tuition signal
-        "inverse_poverty": 0.15,  # New - additional economic stability signal
-        "first_gen": 0.20,        # Decreased from 0.30 - still values mission
-        "k12": 0.10,              # Decreased from 0.20 - market size still relevant
-        "inverse_edi": 0.05,      # Decreased from 0.10 - deprioritize desert factor
+        "income": 0.60,           # Increased - strongest tuition signal
+        "inverse_poverty": 0.25,  # Increased - economic stability signal
+        "k12": 0.10,              # Market size
+        "inverse_edi": 0.05,      # Low competition signal
     }
 
     hpfi = (
         weights["income"] * income_norm +
         weights["inverse_poverty"] * inverse_poverty_norm +
-        weights["first_gen"] * first_gen_norm +
         weights["k12"] * k12_norm +
         weights["inverse_edi"] * inverse_edi
     )
@@ -531,7 +528,7 @@ def load_block_group_data():
     gdf['GEOID'] = gdf['GEOID'].astype(str)
     demographics['block_group_id'] = demographics['block_group_id'].astype(str)
 
-    sentinel_cols = ['income', 'poverty_rate', 'total_pop', 'pct_black', 'pct_white', 'hh_with_u18', '%Christian', '%first_gen']
+    sentinel_cols = ['income', 'poverty_rate', 'total_pop', 'pct_black', 'pct_white', 'hh_with_u18', '%Christian']
     for col in sentinel_cols:
         if col in demographics.columns:
             demographics[col] = demographics[col].replace(-666666666, pd.NA)
@@ -620,10 +617,6 @@ def create_choropleth_map(
     # Merge geodata with demographic data
     plot_data = gdf_filtered.merge(demographics_filtered, left_on='GEOID', right_on='block_group_id', how='left')
 
-    if 'first_gen_pct' not in plot_data.columns and '%first_gen' in plot_data.columns:
-        plot_data['first_gen_pct'] = pd.to_numeric(plot_data['%first_gen'], errors='coerce')
-    if 'first_gen_pct' in plot_data.columns:
-        plot_data['first_gen_pct'] = pd.to_numeric(plot_data['first_gen_pct'], errors='coerce')
     if 'EDI' in plot_data.columns:
         plot_data['EDI'] = pd.to_numeric(plot_data['EDI'], errors='coerce')
     if 'hpfi' in plot_data.columns:
@@ -685,17 +678,16 @@ def create_choropleth_map(
     # Build custom hover template with proper formatting for missing data
     hover_template = '<b>Block Group: %{customdata[0]}</b><br>'
     if use_zones:
-        hover_template += 'Zone: %{customdata[6]}<br>'
+        hover_template += 'Zone: %{customdata[5]}<br>'
     hover_template += 'EDI: %{customdata[1]}<br>'
     hover_template += 'Median Income: %{customdata[2]}<br>'
-    hover_template += 'First-Gen %: %{customdata[3]}<br>'
-    hover_template += 'K-12 Population: %{customdata[4]}<br>'
-    hover_template += 'HPFI: %{customdata[5]}<extra></extra>'
+    hover_template += 'K-12 Population: %{customdata[3]}<br>'
+    hover_template += 'HPFI: %{customdata[4]}<extra></extra>'
     
     # Prepare custom data for hover with proper formatting
     cleaned = plot_data.copy()
 
-    numeric_cols = ['income', 'first_gen_pct', 'k12_pop', 'hpfi', 'EDI']
+    numeric_cols = ['income', 'k12_pop', 'hpfi', 'EDI']
     if not use_zones:
         numeric_cols.append(color_column)
     
@@ -775,7 +767,6 @@ def create_choropleth_map(
             str(row.get('block_group_id', 'N/A')),
             format_value(row, 'EDI', 'number'),
             format_value(row, 'income', 'currency'),
-            format_value(row, 'first_gen_pct', 'percent'),
             format_value(row, 'k12_pop', 'integer'),
             format_value(row, 'hpfi', 'hpfi'),
             zone_val,
@@ -911,7 +902,9 @@ def create_choropleth_map(
         }
         comp_copy = competition_df.copy()
         comp_copy['type'] = comp_copy['type'].fillna('Other')
-        comp_copy['color'] = comp_copy['type'].apply(lambda t: palette.get(t, '#2CA02C'))
+        # Map colors based on school type
+        color_list = [palette.get(t, '#2CA02C') for t in comp_copy['type']]
+        comp_copy['color'] = color_list
         comp_copy['capacity'] = pd.to_numeric(comp_copy.get('capacity'), errors='coerce')
 
         def grade_band(label: object) -> str:
@@ -1015,13 +1008,6 @@ def calculate_marketing_priority_bg(demographics_df, cca_campuses):
             score += 2  # High income
         elif 50000 <= income < 75000:
             score += 1  # Upper middle
-        
-        # First generation percentage (higher is better for mission)
-        first_gen = bg.get('%first_gen', 0)
-        if first_gen >= 40:
-            score += 2
-        elif first_gen >= 25:
-            score += 1
         
         # Christian percentage (alignment with mission)
         christian_pct = bg.get('%Christian', 0)
@@ -1318,38 +1304,6 @@ def main():
         )
         demographics_filtered = demographics_filtered[
             demographics_filtered['income'].between(income_range[0], income_range[1], inclusive="both")
-        ]
-
-        fg_series = pd.to_numeric(demographics_filtered.get('first_gen_pct', demographics_filtered.get('%first_gen')), errors='coerce').dropna()
-        if fg_series.empty:
-            fg_min, fg_max = 0.0, 100.0
-        else:
-            fg_min = float(fg_series.min())
-            fg_max = float(fg_series.max())
-            if fg_min == fg_max:
-                fg_max = min(100.0, fg_min + 1.0)
-
-        with st.sidebar.expander("ℹ️ About First-Generation %"):
-            st.write("""
-            **First-Generation** refers to estimated percentage of adults who are 
-            first-generation college graduates (derived from ACS educational attainment data). 
-            
-            This metric helps identify communities where CCA's mission of educational 
-            empowerment resonates strongly. Use broad ranges to explore potential without 
-            limiting outreach opportunities.
-            """)
-
-        first_gen_range = st.sidebar.slider(
-            "First-Generation % Range",
-            min_value=fg_min,
-            max_value=fg_max,
-            value=(fg_min, fg_max),
-            step=1.0,
-            help="Areas with first-gen families often value educational advancement opportunities"
-        )
-        demographics_filtered = demographics_filtered[
-            pd.to_numeric(demographics_filtered.get('first_gen_pct', demographics_filtered.get('%first_gen')), errors='coerce')
-            .between(first_gen_range[0], first_gen_range[1], inclusive="both")
         ]
 
         highlight_hpfi = st.sidebar.checkbox(
