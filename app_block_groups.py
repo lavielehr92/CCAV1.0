@@ -514,19 +514,26 @@ def compute_hpfi_scores(df: pd.DataFrame, edi_col: str = "EDI") -> pd.DataFrame:
     
     proximity_norm = normalise(pd.Series(proximity_scores, index=working.index))
 
-    # Updated weights including campus proximity
+    # Christian % as mission alignment signal (now with block-level variation)
+    christian_series = pd.to_numeric(working.get('%Christian'), errors='coerce').fillna(36.3)
+    # Normalize to 0-1 scale (36.3% min, 47.5% max based on church density)
+    christian_norm = normalise(christian_series)
+
+    # Updated weights including mission alignment
     weights = {
-        "income": 0.50,           # Primary tuition signal
-        "inverse_poverty": 0.20,  # Economic stability
-        "proximity": 0.15,        # NEW - Distance to CCA campuses
-        "k12": 0.10,              # Market size
-        "inverse_edi": 0.05,      # Low competition
+        "income": 0.45,           # Primary tuition signal (down from 50%)
+        "inverse_poverty": 0.18,  # Economic stability (down from 20%)
+        "proximity": 0.13,        # Distance to CCA campuses (down from 15%)
+        "christian": 0.12,        # NEW - Mission alignment (faith community strength)
+        "k12": 0.09,              # Market size (down from 10%)
+        "inverse_edi": 0.03,      # Low competition (down from 5%)
     }
 
     hpfi = (
         weights["income"] * income_norm +
         weights["inverse_poverty"] * inverse_poverty_norm +
         weights["proximity"] * proximity_norm +
+        weights["christian"] * christian_norm +
         weights["k12"] * k12_norm +
         weights["inverse_edi"] * inverse_edi
     )
@@ -1037,10 +1044,13 @@ def calculate_marketing_priority_bg(demographics_df, cca_campuses):
         elif 50000 <= income < 75000:
             score += 1  # Upper middle
         
-        # Christian percentage (alignment with mission)
+        # Christian percentage (mission alignment - now with block-level variation)
         christian_pct = bg.get('%Christian', 0)
-        if christian_pct >= 30:
-            score += 1
+        if christian_pct >= 43:  # Top quartile (high church density)
+            score += 2  # Strong faith community
+        elif christian_pct >= 37:  # Above county baseline
+            score += 1  # Moderate faith alignment
+        # Below 37% = 0 points (secular/diverse areas)
         
         # K-12 population (market size)
         k12_pop = bg.get('k12_pop', 0)
@@ -1615,7 +1625,7 @@ def main():
         # HPFI detailed breakdown
         if 'hpfi' in demographics_filtered.columns:
             st.markdown("### 💡 Family Potential Index Details")
-            st.caption("HPFI measures tuition-paying capacity through income (50%), economic stability (15%), mission alignment (20%), and market size (15%)")
+            st.caption("HPFI measures tuition-paying capacity: Income (45%), Economic Stability (18%), Campus Proximity (13%), Mission Alignment/Christian % (12%), K-12 Market (9%), Low Competition (3%)")
             hpfi_cols = st.columns(3)
             hpfi_avg = demographics_filtered['hpfi'].mean()
             hpfi_top = (demographics_filtered['hpfi'] >= 0.75).sum()
