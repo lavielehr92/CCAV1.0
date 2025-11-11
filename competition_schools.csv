@@ -1,0 +1,15 @@
+school_name,type,grades,address,notable_info,capacity_hint,lat,lon,capacity
+St. Barnabas Catholic School,Catholic,K-8,"6334 Buist Ave, Philadelphia, PA",Independence Mission Schools network; broad financial aid,medium,39.9224727236,-75.226760178385,350
+St. Thomas Aquinas Catholic School,Catholic,PK-8,"1631 S 18th St, Philadelphia, PA",South Philadelphia Independence Mission School,medium,39.930819087001,-75.174792018053,350
+St. Francis de Sales School,Catholic,PK-8,"921 S 47th St, Philadelphia, PA",University City parish school with strong neighborhood ties,medium,39.947543603527,-75.215738363368,350
+St. Peter's School,Private,PK-8,"319 Lombard St, Philadelphia, PA",Independent private drawing families from University City,medium,39.942531746081,-75.14770499218,350
+Greene Towne Montessori School,Private,PK-3,"2133 Arch St, Philadelphia, PA",Progressive Montessori; overlaps on early grades,small,39.956035126971,-75.17581719381,200
+Harrity Elementary – Mastery Schools,Charter,K-8,"5600 Christian St, Philadelphia, PA",Mastery charter campus serving Southwest families,large,39.948388537622,-75.235565930009,600
+Independence Charter School,Charter,K-8,"1600 Lombard St, Philadelphia, PA",Citywide dual-language STEAM charter,large,39.945005691278,-75.168625014326,600
+Christopher Columbus Charter School,Charter,K-8,"1242 S 13th St, Philadelphia, PA",Two S. Philly campuses; attracts Center City families,large,39.934477433328,-75.165376239298,600
+Russell Byers Charter School,Charter,PK-8,"1911 Arch St, Philadelphia, PA",Expeditionary learning charter downtown,large,39.955477976247,-75.171349401257,600
+The Philadelphia School,Private,PK-8,"2501 Lombard St, Philadelphia, PA",Independent progressive school serving Center/University City,medium,39.946764678253,-75.181704008732,350
+Holy Child Academy,Private,PK-8,"475 Shadeland Ave, Drexel Hill, PA",Independent private west of city appealing to same families,medium,39.948350457515,-75.293812428042,350
+Friends Select School,Private,PK-12,"17th St & Benjamin Franklin Pkwy, Philadelphia, PA",Quaker school; lower grades overlap with CCA targets,large,39.955946434221,-75.167919477467,600
+Philadelphia Free School,Private,K-12,"4950 Springfield Ave, Philadelphia, PA",Democratic school model; attracts West Philly families,small,39.944448105142,-75.218658873435,200
+The City School,Christian,K-12,"860 N 24th St, Philadelphia, PA",Faith-based independent; competes for Christian families,medium,39.971456936719,-75.176193617843,350

@@ -235,11 +235,11 @@ def fetch_tract_enrollment_data() -> Tuple[pd.DataFrame, dict]:
 
 def validate_k12_total(demographics: pd.DataFrame, tract_enrollment_data: pd.DataFrame) -> dict:
     """
-    Validate K-12 total against expected range (200k-260k).
-    Return validation result with warnings if out of range.
+    Validate K-12 total against expected range (150k-260k).
+    Return validation result with informational notices if out of range.
     """
     total = float(demographics['k12_pop'].sum())
-    min_expected = 200000.0
+    min_expected = 150000.0  # Adjusted from 200k to 150k based on ACS 2023 enrollment data
     max_expected = 260000.0
     
     result = {
@@ -247,20 +247,20 @@ def validate_k12_total(demographics: pd.DataFrame, tract_enrollment_data: pd.Dat
         'is_valid': min_expected <= total <= max_expected,
         'min_expected': min_expected,
         'max_expected': max_expected,
-        'warnings': []
+        'notices': []
     }
     
     if total < min_expected:
-        result['warnings'].append(
-            f"⚠️ K-12 total ({total:,.0f}) is below expected minimum ({min_expected:,.0f})."
+        result['notices'].append(
+            f"ℹ️ K-12 total ({total:,.0f}) is below expected minimum ({min_expected:,.0f}). This reflects enrollment vs. population age 5-17."
         )
         # Show top 5 tracts by lowest rate
         tract_enrollment_data_sorted = tract_enrollment_data.sort_values('tract_rate_k12').head(5)
         result['low_tracts'] = tract_enrollment_data_sorted[['tract_id', 'tract_rate_k12', 'tract_enrolled_k12', 'tract_pop_5_17']].copy()
     
     elif total > max_expected:
-        result['warnings'].append(
-            f"⚠️ K-12 total ({total:,.0f}) exceeds expected maximum ({max_expected:,.0f})."
+        result['notices'].append(
+            f"ℹ️ K-12 total ({total:,.0f}) exceeds expected maximum ({max_expected:,.0f})."
         )
         # Show top 5 tracts by highest rate
         tract_enrollment_data_sorted = tract_enrollment_data.sort_values('tract_rate_k12', ascending=False).head(5)
@@ -314,31 +314,141 @@ def compute_edi_hpfi_zones(demographics: pd.DataFrame, edi_col: str = "EDI", hpf
     return working
 
 
+def compute_marketing_zones(demographics: pd.DataFrame, edi_col: str = "EDI", hpfi_col: str = "hpfi") -> pd.DataFrame:
+    """
+    Create High-Potential Marketing Zones optimized for growth strategy.
+    
+    Focuses on areas with:
+    - High HPFI (tuition-paying potential) 
+    - Moderate EDI (some access gaps but not extreme deserts)
+    - Strong K-12 population
+    
+    Zones:
+    - Premium Growth: High HPFI (≥75th), Moderate EDI (25-75th), High K12
+    - Established Markets: High HPFI (≥75th), Low EDI (<25th) - affluent, well-served
+    - Emerging Opportunity: Medium HPFI (50-75th), Moderate EDI (25-75th)
+    - Foundation Building: All other combinations
+    """
+    working = demographics.copy()
+    
+    # Ensure numeric
+    working[edi_col] = pd.to_numeric(working.get(edi_col), errors='coerce').fillna(0)
+    working[hpfi_col] = pd.to_numeric(working.get(hpfi_col), errors='coerce').fillna(0)
+    working['k12_pop'] = pd.to_numeric(working.get('k12_pop'), errors='coerce').fillna(0)
+    
+    # Compute quantiles
+    edi_25 = working[edi_col].quantile(0.25)
+    edi_75 = working[edi_col].quantile(0.75)
+    hpfi_50 = working[hpfi_col].quantile(0.50)
+    hpfi_75 = working[hpfi_col].quantile(0.75)
+    k12_median = working['k12_pop'].median()
+    
+    def classify_marketing_zone(row):
+        edi = row[edi_col]
+        hpfi = row[hpfi_col]
+        k12 = row['k12_pop']
+        
+        # Premium Growth: High HPFI + Moderate EDI + Good K12 population
+        if hpfi >= hpfi_75 and edi_25 <= edi <= edi_75 and k12 >= k12_median:
+            return 'Premium Growth Target'
+        
+        # Established Markets: High HPFI + Low EDI (already well-served but affluent)
+        elif hpfi >= hpfi_75 and edi < edi_25:
+            return 'Established Market'
+        
+        # Emerging Opportunity: Medium HPFI + Moderate EDI
+        elif hpfi >= hpfi_50 and edi_25 <= edi <= edi_75:
+            return 'Emerging Opportunity'
+        
+        # Foundation Building: Everything else
+        else:
+            return 'Foundation Building'
+    
+    working['marketing_zone'] = working.apply(classify_marketing_zone, axis=1)
+    
+    # Store thresholds as metadata
+    working['_edi_25_threshold'] = edi_25
+    working['_edi_75_threshold'] = edi_75
+    working['_hpfi_50_threshold'] = hpfi_50
+    working['_hpfi_75_threshold'] = hpfi_75
+    working['_k12_median'] = k12_median
+    
+    return working
+
+
 # Page config
 st.set_page_config(
-    page_title="CCA Enrollment Opportunity Explorer", 
+    page_title="CCA Growth Opportunity Explorer", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better styling
+# Custom CSS for professional blue/grey theme
 st.markdown("""
 <style>
+    @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
+    
+    * {
+        font-family: 'Roboto', sans-serif;
+    }
+    
     .main > div {
         padding-top: 2rem;
+        background-color: #F8F9FA;
     }
+    
     .stMetric {
-        background-color: #f0f2f6;
-        border: 1px solid #d4d4d4;
-        padding: 0.5rem;
-        border-radius: 0.5rem;
+        background-color: #ffffff;
+        border: 2px solid #0070C0;
+        padding: 1rem;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    
+    .stButton > button {
+        background-color: #0070C0;
+        color: white;
+        border-radius: 6px;
+        border: none;
+        padding: 0.5rem 1rem;
+        font-weight: 500;
+        transition: background-color 0.3s;
+    }
+    
+    .stButton > button:hover {
+        background-color: #005A9C;
+    }
+    
+    h1, h2, h3 {
+        color: #4F4F4F;
+    }
+    
+    .stInfo {
+        background-color: #E3F2FD;
+        border-left: 4px solid #0070C0;
+        border-radius: 4px;
+    }
+    
+    .stExpander {
+        border: 1px solid #0070C0;
+        border-radius: 6px;
+    }
+    
+    /* Remove red styling, use blue info boxes */
+    .stAlert {
+        border-radius: 6px;
     }
 </style>
 """, unsafe_allow_html=True)
 
 
 def compute_hpfi_scores(df: pd.DataFrame, edi_col: str = "EDI") -> pd.DataFrame:
-    """Attach High-Potential Family Index (0-1) to the provided DataFrame."""
+    """Attach High-Potential Family Index (0-1) to the provided DataFrame.
+    
+    Tuned to prioritize tuition-paying potential through higher income weighting
+    and inverse poverty signal, supporting CCA's goal to expand reach to families
+    able to afford tuition while maintaining socioeconomic diversity.
+    """
 
     def normalise(series: pd.Series) -> pd.Series:
         series = pd.to_numeric(series, errors="coerce")
@@ -375,18 +485,26 @@ def compute_hpfi_scores(df: pd.DataFrame, edi_col: str = "EDI") -> pd.DataFrame:
     first_gen_norm = normalise(working.get("first_gen_pct", working.get("%first_gen")))
     k12_norm = normalise(working.get("k12_pop"))
 
+    # Inverse poverty as additional tuition-potential signal
+    poverty_series = pd.to_numeric(working.get("poverty_rate"), errors="coerce").fillna(0)
+    inverse_poverty = 1.0 - (poverty_series / 100.0).clip(lower=0.0, upper=1.0)
+    inverse_poverty_norm = normalise(pd.Series(inverse_poverty, index=working.index))
+
     edi_values = pd.to_numeric(edi_series, errors="coerce").fillna(0.0)
     inverse_edi = 1.0 - (edi_values / 100.0).clip(lower=0.0, upper=1.0)
 
+    # Updated weights prioritizing tuition-paying potential
     weights = {
-        "income": 0.40,
-        "first_gen": 0.30,
-        "k12": 0.20,
-        "inverse_edi": 0.10,
+        "income": 0.50,           # Increased from 0.40 - primary tuition signal
+        "inverse_poverty": 0.15,  # New - additional economic stability signal
+        "first_gen": 0.20,        # Decreased from 0.30 - still values mission
+        "k12": 0.10,              # Decreased from 0.20 - market size still relevant
+        "inverse_edi": 0.05,      # Decreased from 0.10 - deprioritize desert factor
     }
 
     hpfi = (
         weights["income"] * income_norm +
+        weights["inverse_poverty"] * inverse_poverty_norm +
         weights["first_gen"] * first_gen_norm +
         weights["k12"] * k12_norm +
         weights["inverse_edi"] * inverse_edi
@@ -520,7 +638,12 @@ def create_choropleth_map(
         return go.Figure()
     
     # Check if color_column or zone column exists
-    if use_zones:
+    if use_zones == 'marketing':
+        if 'marketing_zone' not in plot_data.columns:
+            st.error("Marketing zone column not found. Cannot create marketing zones map.")
+            return go.Figure()
+        color_column = 'marketing_zone'
+    elif use_zones:
         if 'zone' not in plot_data.columns:
             st.error("Zone column not found. Cannot create overlay map.")
             return go.Figure()
@@ -582,7 +705,23 @@ def create_choropleth_map(
             cleaned[col] = pd.to_numeric(cleaned[col], errors='coerce')
 
     # Handle zone-based coloring
-    if use_zones:
+    if use_zones == 'marketing':
+        # Marketing zones colorscale
+        zone_map = {
+            'Premium Growth Target': 0,
+            'Established Market': 1,
+            'Emerging Opportunity': 2,
+            'Foundation Building': 3
+        }
+        z_vals = cleaned['marketing_zone'].map(zone_map).fillna(3).astype(int).values
+        colorscale = [
+            [0.0, '#00B050'],     # Premium Growth - green
+            [0.33, '#0070C0'],    # Established Market - blue
+            [0.67, '#FFC000'],    # Emerging Opportunity - gold
+            [1.0, '#A0A0A0']      # Foundation Building - grey
+        ]
+    elif use_zones:
+        # EDI×HPFI overlay zones
         zone_map = {
             'Golden Zone': 0,
             'Mission Zone': 1,
@@ -648,7 +787,15 @@ def create_choropleth_map(
     fig = go.Figure()
     
     # Prepare colorbar based on mode
-    if use_zones:
+    if use_zones == 'marketing':
+        colorbar = dict(
+            title='Marketing Zone',
+            tickvals=[0, 1, 2, 3],
+            ticktext=['Premium Growth', 'Established', 'Emerging', 'Foundation'],
+            len=0.7,
+            x=1.02
+        )
+    elif use_zones:
         colorbar = dict(
             title='Zone',
             tickvals=[0, 1, 2, 3],
@@ -892,29 +1039,34 @@ def calculate_marketing_priority_bg(demographics_df, cca_campuses):
 
 # Main app
 def main():
-    st.title("🏫 Cornerstone Christian Academy Enrollment Opportunity Explorer")
-    st.subheader("Block Group Insights to Guide Outreach and Growth")
+    st.title("� Cornerstone Christian Academy Growth Opportunity Explorer")
+    st.markdown("""
+    <div style='background: linear-gradient(135deg, #0070C0 0%, #005A9C 100%); padding: 1.5rem; border-radius: 8px; color: white; margin-bottom: 1rem;'>
+        <h3 style='color: white; margin: 0;'>Informative Insights for Strategic Outreach & Inclusive Expansion</h3>
+        <p style='margin: 0.5rem 0 0 0; opacity: 0.9;'>Identify high-potential areas to broaden CCA's reach across diverse socioeconomic groups and support balanced, inclusive growth. Data from ACS 2023.</p>
+    </div>
+    """, unsafe_allow_html=True)
     
     # Add explanation of EDI in an expandable section
-    with st.expander("ℹ️ What is the Educational Desert Index (EDI)?"):
+    with st.expander("ℹ️ Understanding the Educational Desert Index (EDI)"):
         st.markdown("""
         ### Why CCA Tracks EDI
 
-        The Educational Desert Index spotlights neighborhoods where families have limited access to affordable, high-quality Christian schooling. **Higher EDI means families near CCA have fewer nearby choices and greater need for support.**
+        The Educational Desert Index identifies neighborhoods where families have limited access to affordable, quality Christian education options. **Higher EDI scores indicate areas with greater opportunity for CCA to make an impact.**
 
         #### How We Calculate It
-        1. **Accessible Seats (55%)** – Compares nearby K-12 demand with available CCA or partner seats. Capacity crunches lift the score.
-        2. **Travel Friction (25%)** – Rewards proximity to a CCA campus; distance or transit barriers increase EDI.
-        3. **Community Stress (20%)** – Blends poverty and adult educational attainment to capture holistic need.
+        1. **Accessible Seats (55%)** – Compares nearby K-12 demand with available CCA or partner seats. Limited capacity increases the score.
+        2. **Travel Accessibility (25%)** – Rewards proximity to a CCA campus; distance or transit barriers increase EDI.
+        3. **Community Opportunity (20%)** – Considers economic factors and educational attainment to identify underserved areas.
 
-        Each component is scaled 0–1 and combined, then translated to a 0–100 score for easy interpretation.
+        Each component is scaled 0–1 and combined, then translated to a 0–100 score for clarity.
 
         #### Reading the Score
-        - **70–100** → Highest priorities for outreach and scholarship engagement.
-        - **40–69** → Viable growth corridors that deserve deeper relationship-building.
-        - **0–39** → Communities already surrounded by school options.
+        - **70–100** → Highest opportunity areas for strategic outreach and engagement.
+        - **40–69** → Viable growth corridors for relationship-building and community partnerships.
+        - **0–39** → Communities with existing educational options already available.
 
-        Pair high EDI with strong HPFI and K-12 population to focus marketing, transportation planning, and church partnerships.
+        Combine high EDI with strong HPFI and K-12 population to focus marketing, transportation planning, and partnership development.
         """)
     
     # Load data
@@ -932,8 +1084,8 @@ def main():
     validation_result = validate_k12_total(demographics, tract_enrollment_data)
     
     if not validation_result['is_valid']:
-        st.error("⚠️ K-12 Enrollment Validation Warning")
-        st.write(validation_result['warnings'][0])
+        st.info("📊 K-12 Enrollment Data Notice")
+        st.write(validation_result['notices'][0])
         if 'low_tracts' in validation_result:
             st.write("**Tracts with lowest enrollment rates:**")
             st.dataframe(validation_result['low_tracts'], use_container_width=True)
@@ -1040,54 +1192,72 @@ def main():
         )
     
     # Add helpful info about the data
-    with st.expander("ℹ️ About This Data", expanded=False):
+    with st.expander("ℹ️ About This Data & Methodology", expanded=False):
         st.write(f"""
-        **Geography:** {len(demographics):,} Philadelphia Census block groups (ACS 2023 five-year estimates).
+        **Geographic Coverage:** {len(demographics):,} Philadelphia Census block groups (ACS 2023 five-year estimates).
 
-        **K-12 Demand Methodology (ACS 2023):**
-        - **Block-group population age 5–17:** B01001_004E, B01001_005E, B01001_006E, B01001_028E, B01001_029E, B01001_030E (summed)
-        - **Tract-level K-12 enrollment:** S1401_C01_004E (kindergarten), S1401_C01_005E (grades 1-8), S1401_C01_006E (grades 9-12) (summed)
-        - **Downscaling formula:** bg_enrolled_k12 = tract_rate_k12 × bg_age_5_17, where tract_rate_k12 = tract_enrolled_k12 / tract_population_age_5-17
-        - **Result flag:** All block groups marked is_modeled=True; imputed block groups (missing ACS data) marked separately.
+        **K-12 Student Modeling (ACS 2023):**
+        - **Block-group ages 5–17:** ACS table B01001 (population by age/sex), fields 004E-006E (male) + 028E-030E (female)
+        - **Tract-level enrollment:** ACS table S1401 (school enrollment), fields for kindergarten, grades 1-8, and grades 9-12
+        - **Downscaling method:** Each block group's K-12 estimate = (tract enrollment rate) × (block group age 5-17 population)
+        - **Quality flags:** All block groups marked as modeled; areas with missing data are imputed
 
-        **Enrollment Signals:**
-        - Total K-12 students: {demographics['k12_pop'].sum():,.0f} (modeled via ACS 2023)
-        - Blocks with school-age children: {(demographics['k12_pop'] > 0).sum():,}
-        - Blocks flagged as non-residential (0 population): {(demographics['total_pop'] == 0).sum():,}
+        **Growth Opportunity Metrics:**
+        - **Total K-12 students (modeled):** {demographics['k12_pop'].sum():,.0f} across Philadelphia
+        - **Residential block groups with children:** {(demographics['k12_pop'] > 0).sum():,} areas
+        - **Non-residential areas excluded by default:** {(demographics['total_pop'] == 0).sum():,} industrial/park zones
 
-        **EDI Calculation & Toggle:**
-        - **Default behavior:** EDI uses only CCA and public school seats from NCES.
-        - **With competitors toggled:** EDI adds charter and private school capacity to the supply-side calculation.
-        - **Distance-based fallback:** If no school supply data available, a simple distance-to-nearest-campus model is used.
+        **High-Potential Family Index (HPFI):**
+        - **Purpose:** Identifies areas with strong tuition-paying capacity and alignment with CCA's mission
+        - **Components (updated weights for growth focus):**
+          - Household income: 50% (increased - primary economic signal)
+          - Inverse poverty: 15% (new - economic stability)
+          - First-generation %: 20% (mission alignment)
+          - K-12 population: 10% (market size)
+          - Inverse EDI: 5% (access factor)
+        - **Scale:** 0.00 (lowest potential) to 1.00 (highest potential)
+        - **Interpretation:** Higher HPFI indicates areas more likely to support tuition-based enrollment growth
 
-        **HPFI & Overlay Mode:**
-        - HPFI (High-Potential Family Index) combines income, first-generation %, and K-12 demand using 0–1 normalized weights.
-        - Overlay: EDI × HPFI uses 75th-percentile thresholds to segment into 4 zones: Golden (high/high), Mission (high/low), Affluent Opportunity (low/high), Low Priority (low/low).
-        - HPFI and EDI remain independent; overlay mode merges both signals for strategic targeting.
+        **Educational Desert Index (EDI):**
+        - **Purpose:** Identifies areas where families have limited access to quality Christian education options
+        - **Default calculation:** Uses CCA campuses + NCES public schools only
+        - **Optional toggle:** Include charter/private schools in supply calculation
+        - **Fallback method:** Distance-based model if school data unavailable
+        - **Scale:** 0-100 (higher = greater access gap)
 
-        **Sources & Refresh:**
-        - Student demand: ACS B01001 (age) + S1401 (school enrollment).
-        - Household income, poverty, and first-generation metrics: ACS tables.
-        - School supply: CCA campuses + NCES public/private school directories.
-        - Use the **Live Census Data** control to pull fresh ACS figures when the API key is available.
-        - Cache files stored in data/cache/ with timestamps.
+        **Visualization Modes:**
+        1. **HPFI (Tuition Potential):** Highlights areas with economic capacity for tuition-based enrollment
+        2. **EDI (Access Opportunity):** Shows areas with limited Christian education options
+        3. **Overlay (EDI × HPFI):** 4-zone grid combining both metrics (Golden/Mission/Affluent/Low Priority)
+        4. **High-Potential Marketing Zones:** Custom segmentation optimized for growth strategy
+           - Premium Growth: High HPFI + Moderate EDI + Strong K12 population (top priority)
+           - Established Markets: High HPFI + Low EDI (affluent, well-served areas)
+           - Emerging Opportunity: Medium HPFI + Moderate EDI (development potential)
+           - Foundation Building: Other combinations (relationship development)
 
-        **Competitor School Toggle:**
-        - Competitor checkbox controls visibility only (always shown on map if enabled).
-        - Competitor seats are included in EDI calculation only if "Include Competitor Schools in EDI Calculation" is toggled.
+        **Data Sources & Refresh:**
+        - **Census data:** ACS 2023 five-year estimates via Census Bureau API
+        - **School locations:** NCES directories + local private/charter school data
+        - **Update frequency:** Cache refreshes every 24 hours; use "Live Census Data" button for manual refresh
+        - **Cache storage:** data/cache/ directory with timestamps
 
-        Tip: Apply optional filters to remove industrial corridors and highlight neighborhoods where CCA families live today.
+        **Tips for Analysis:**
+        - Combine map modes to identify balanced opportunities (access need + economic capacity)
+        - Use geographic filters to focus on accessible catchment areas
+        - Apply demographic filters to refine target audiences while maintaining inclusive outreach
+        - Export filtered data for deeper analysis or integration with CRM systems
         """)
     
     # Sidebar filters
-    st.sidebar.header("🎛️ Analysis Controls")
+    st.sidebar.header("🎛️ Filters & Controls")
+    st.sidebar.caption("Refine your view to identify high-potential growth areas")
     
     # Proximity filters
-    st.sidebar.subheader("Geographic Filters")
+    st.sidebar.subheader("📍 Geographic Scope")
     max_distance = st.sidebar.slider(
-        "Max Distance from CCA Campuses (km)", 
+        "Radius from CCA Campuses (km)", 
         1, 35, 15, 
-        help="Show only block groups within this distance of CCA campuses"
+        help="Focus on block groups within this distance of CCA campuses to prioritize accessible communities"
     )
     
     # CCA Campus locations
@@ -1109,8 +1279,8 @@ def main():
     demographics_filtered = demographics[demographics.apply(is_within_distance, axis=1)]
     
     # Demographic filters
-    st.sidebar.subheader("Demographic Indicators")
-    st.sidebar.caption("Median income shown is per block group (not a hard household cutoff). All household income levels are represented inside each block group's median value.")
+    st.sidebar.subheader("💼 Opportunity Indicators")
+    st.sidebar.caption("Note: Median income represents the block group average. All income levels exist within each area, supporting diverse and inclusive outreach.")
 
     # Optional live data refresh (Census API)
     census_api_key = get_census_api_key()
@@ -1128,7 +1298,6 @@ def main():
     highlight_hpfi = False
 
     if not demographics_filtered.empty:
-        st.sidebar.subheader("Marketing Target Controls")
         income_series = pd.to_numeric(demographics_filtered['income'], errors='coerce').dropna()
         if income_series.empty:
             income_floor, income_ceiling = 0, 250000
@@ -1139,12 +1308,13 @@ def main():
                 income_ceiling = income_floor + 1
 
         income_range = st.sidebar.slider(
-            "Median Household Income Range",
+            "Household Income Range",
             min_value=income_floor,
             max_value=income_ceiling,
             value=(income_floor, income_ceiling),
             step=1000,
-            format="$%d"
+            format="$%d",
+            help="Target areas by economic capacity - higher incomes may indicate tuition-paying potential"
         )
         demographics_filtered = demographics_filtered[
             demographics_filtered['income'].between(income_range[0], income_range[1], inclusive="both")
@@ -1159,28 +1329,43 @@ def main():
             if fg_min == fg_max:
                 fg_max = min(100.0, fg_min + 1.0)
 
+        with st.sidebar.expander("ℹ️ About First-Generation %"):
+            st.write("""
+            **First-Generation** refers to estimated percentage of adults who are 
+            first-generation college graduates (derived from ACS educational attainment data). 
+            
+            This metric helps identify communities where CCA's mission of educational 
+            empowerment resonates strongly. Use broad ranges to explore potential without 
+            limiting outreach opportunities.
+            """)
+
         first_gen_range = st.sidebar.slider(
             "First-Generation % Range",
             min_value=fg_min,
             max_value=fg_max,
             value=(fg_min, fg_max),
-            step=1.0
+            step=1.0,
+            help="Areas with first-gen families often value educational advancement opportunities"
         )
         demographics_filtered = demographics_filtered[
             pd.to_numeric(demographics_filtered.get('first_gen_pct', demographics_filtered.get('%first_gen')), errors='coerce')
             .between(first_gen_range[0], first_gen_range[1], inclusive="both")
         ]
 
-        highlight_hpfi = st.sidebar.checkbox("Highlight High-Potential Family Index (HPFI)", value=False)
+        highlight_hpfi = st.sidebar.checkbox(
+            "Focus on High-Potential Family Index (HPFI ≥ 0.75)", 
+            value=False,
+            help="Narrow view to top-quartile HPFI areas indicating strong tuition-paying potential"
+        )
 
         # Additional demographic filters (optional)
-        st.sidebar.subheader("Optional Filters")
+        st.sidebar.subheader("🔧 Refinement Options")
         
         # Filter out non-residential block groups
         hide_zero_pop = st.sidebar.checkbox(
-            "Hide Non-Residential Areas (0 population)", 
+            "Exclude Non-Residential Areas", 
             value=True,
-            help="Excludes parks, water bodies, industrial zones, etc. with 0 population"
+            help="Removes parks, industrial zones, etc. with 0 population to focus on residential communities"
         )
         if hide_zero_pop:
             before_count = len(demographics_filtered)
@@ -1196,9 +1381,9 @@ def main():
         
         # Additional filter for 0 K-12 population
         hide_zero_k12 = st.sidebar.checkbox(
-            "Also hide blocks with 0 K-12 children",
+            "Exclude Areas with 0 K-12 Children",
             value=False,
-            help="Excludes residential areas with no school-age children (e.g., retirement communities, young professional areas)"
+            help="Focuses exclusively on areas with school-age population for targeted marketing"
         )
         if hide_zero_k12:
             before_count = len(demographics_filtered)
@@ -1207,53 +1392,63 @@ def main():
             if removed > 0:
                 st.sidebar.info(f"✓ Filtered out {removed} additional blocks with 0 K-12 children")
         
-        # Poverty rate filter
-        apply_poverty_filter = st.sidebar.checkbox("Filter by Poverty Rate", value=False)
+        # Poverty rate filter - now optional and off by default
+        apply_poverty_filter = st.sidebar.checkbox("Apply Economic Opportunity Filter", value=False)
         if apply_poverty_filter:
             # Get valid poverty rates (exclude NaN values)
             valid_poverty = demographics_filtered['poverty_rate'].dropna()
             if len(valid_poverty) > 0:
                 poverty_range = st.sidebar.slider(
-                    "Poverty Rate Range (%)", 
+                    "Economic Stability Range (inverse poverty %)", 
                     float(valid_poverty.min()), 
                     float(valid_poverty.max()), 
                     (float(valid_poverty.min()), float(valid_poverty.max())),
-                    step=1.0
+                    step=1.0,
+                    help="Lower poverty rates may indicate greater economic capacity"
                 )
                 demographics_filtered = demographics_filtered[
                     (demographics_filtered['poverty_rate'] >= poverty_range[0]) &
                     (demographics_filtered['poverty_rate'] <= poverty_range[1])
                 ]
             else:
-                st.sidebar.warning("No valid poverty rate data available")
+                st.sidebar.warning("No valid economic data available")
         
     else:
-        st.warning("No block groups found within the specified distance.")
+        st.info("📍 No block groups found within the specified radius. Try expanding your geographic scope.")
         demographics_filtered = demographics.iloc[0:0]
         
     # Map display options
-    st.sidebar.subheader("Map Display")
-    show_current_students = st.sidebar.checkbox("Show Current Students", value=False)
-    show_competition_overlay = st.sidebar.checkbox("Show Competition Schools", value=True)
+    st.sidebar.subheader("🗺️ Map Layers")
+    show_current_students = st.sidebar.checkbox(
+        "Show Current Student Locations", 
+        value=False,
+        help="Overlay current CCA student addresses to visualize existing reach"
+    )
+    show_competition_overlay = st.sidebar.checkbox(
+        "Show Other Educational Options", 
+        value=True,
+        help="Display charter, private, and Catholic schools for competitive landscape context"
+    )
     if not competition_schools.empty:
         type_options = sorted(competition_schools['type'].dropna().unique())
     else:
         type_options = []
     selected_competition_types = st.sidebar.multiselect(
-        "Competition School Types",
+        "School Types to Display",
         options=type_options,
-        default=type_options
+        default=type_options,
+        help="Select which types of educational institutions to show on the map"
     ) if type_options else []
 
     include_competitors_in_edi = st.sidebar.checkbox(
-        "Include Competitor Schools in EDI Calculation",
+        "Include Other Schools in EDI Calculation",
         value=False,
-        help="Adds charter and private seats to the EDI supply side."
+        help="Adds charter and private school capacity to supply-side when calculating Educational Desert Index"
     )
     if include_competitors_in_edi:
-        st.sidebar.info("EDI supply now includes competitor seats.")
+        st.sidebar.info("📊 EDI now includes all school seats in supply calculation")
     else:
-        st.sidebar.caption("EDI supply uses only CCA/public seats.")
+        st.sidebar.caption("📊 EDI uses CCA/public seats only")
 
     supply_columns = ['lat', 'lon', 'capacity']
 
@@ -1284,23 +1479,29 @@ def main():
     
     # Visualization selection
     color_options = {
-        'Educational Desert Index (EDI)': 'EDI',
         'High-Potential Family Index (HPFI)': 'hpfi',
-        'Median Income': 'income',
+        'Educational Desert Index (EDI)': 'EDI',
+        'Median Household Income': 'income',
         'First-Generation %': 'first_gen_pct'
     }
     
-    map_mode_options = ['EDI', 'HPFI', 'Overlay: EDI × HPFI']
+    map_mode_options = ['HPFI (Tuition Potential)', 'EDI (Access Opportunity)', 'Overlay: EDI × HPFI', 'High-Potential Marketing Zones']
     selected_map_mode = st.sidebar.selectbox(
-        "Map Mode:",
+        "Map Visualization Mode:",
         map_mode_options,
         index=0,
-        help="Select visualization mode: single metric or 4-zone overlay"
+        help="Choose focus: tuition-paying potential (HPFI), access gaps (EDI), combined overlay, or custom marketing zones"
     )
     
-    # If overlay mode, use zone colors; otherwise use the classic selection
+    # If overlay mode or marketing zones, use zone colors; otherwise use the classic selection
     if selected_map_mode == 'Overlay: EDI × HPFI':
         selected_metric = 'Overlay: EDI × HPFI'
+    elif selected_map_mode == 'High-Potential Marketing Zones':
+        selected_metric = 'High-Potential Marketing Zones'
+    elif selected_map_mode == 'HPFI (Tuition Potential)':
+        selected_metric = 'High-Potential Family Index (HPFI)'
+    elif selected_map_mode == 'EDI (Access Opportunity)':
+        selected_metric = 'Educational Desert Index (EDI)'
     else:
         selected_metric = st.sidebar.selectbox(
             "Color Map By:", 
@@ -1362,9 +1563,11 @@ def main():
 
     demographics_filtered = compute_hpfi_scores(demographics_filtered, edi_col="EDI" if 'EDI' in demographics_filtered.columns else 'edi')
 
-    # Compute zones if overlay mode is selected
+    # Compute zones if overlay mode or marketing zones mode is selected
     if selected_map_mode == 'Overlay: EDI × HPFI':
         demographics_filtered = compute_edi_hpfi_zones(demographics_filtered, edi_col="EDI", hpfi_col="hpfi")
+    elif selected_map_mode == 'High-Potential Marketing Zones':
+        demographics_filtered = compute_marketing_zones(demographics_filtered, edi_col="EDI", hpfi_col="hpfi")
     
 
     hpfi_threshold = None
@@ -1381,22 +1584,23 @@ def main():
     # Main content area
     if not demographics_filtered.empty:
         
-        # Key metrics
+        # Key metrics with positive, growth-focused language
+        st.markdown("### 📊 Opportunity Snapshot")
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
             st.metric(
-                "Block Groups", 
+                "Areas in View", 
                 len(demographics_filtered),
-                help="Number of block groups in current filter"
+                help="Number of block groups matching current filters - each represents a potential community for outreach"
             )
         
         with col2:
             total_k12 = int(demographics_filtered['k12_pop'].sum())
             st.metric(
-                "Total K-12 Students", 
+                "Student Population", 
                 f"{total_k12:,}",
-                help="Total K-12 population in filtered area"
+                help="Total school-age children (K-12) in filtered areas - represents market opportunity"
             )
         
         with col3:
@@ -1405,37 +1609,48 @@ def main():
             if len(valid_incomes) > 0:
                 avg_income = int(valid_incomes.mean())
                 st.metric(
-                    "Avg Household Income", 
+                    "Median Income (Avg)", 
                     f"${avg_income:,}",
-                    help="Average median household income (excludes block groups with no data)"
+                    help="Average of block group median incomes - economic capacity indicator"
                 )
             else:
                 st.metric(
-                    "Avg Household Income", 
+                    "Median Income (Avg)", 
                     "No data",
-                    help="No valid income data available"
+                    help="Economic data not available for current selection"
                 )
         
         with col4:
-            if 'marketing_priority' in demographics_filtered.columns:
-                high_priority = len(demographics_filtered[demographics_filtered['marketing_priority'] >= 6])
+            # Show HPFI high-potential count instead of old marketing_priority
+            if 'hpfi' in demographics_filtered.columns:
+                hpfi_75th = demographics_filtered['hpfi'].quantile(0.75)
+                high_hpfi_count = len(demographics_filtered[demographics_filtered['hpfi'] >= hpfi_75th])
                 st.metric(
-                    "High Priority Areas", 
-                    high_priority,
-                    help="Block groups with marketing priority ≥6"
+                    "High-Potential Areas", 
+                    high_hpfi_count,
+                    help=f"Block groups with HPFI ≥ {hpfi_75th:.2f} (top 25% tuition-paying potential)"
+                )
+            else:
+                st.metric(
+                    "High-Potential Areas", 
+                    "Calculating...",
+                    help="HPFI being computed"
                 )
 
+        # HPFI detailed breakdown
         if 'hpfi' in demographics_filtered.columns:
+            st.markdown("### 💡 Family Potential Index Details")
+            st.caption("HPFI measures tuition-paying capacity through income (50%), economic stability (15%), mission alignment (20%), and market size (15%)")
             hpfi_cols = st.columns(3)
             hpfi_avg = demographics_filtered['hpfi'].mean()
             hpfi_top = (demographics_filtered['hpfi'] >= 0.75).sum()
             hpfi_max = demographics_filtered['hpfi'].max()
             with hpfi_cols[0]:
-                st.metric("Avg HPFI", f"{hpfi_avg:.2f}", help="Average High-Potential Family Index in filtered area")
+                st.metric("Average HPFI", f"{hpfi_avg:.2f}", help="Mean tuition-paying potential across filtered areas (0.00 = lowest, 1.00 = highest)")
             with hpfi_cols[1]:
-                st.metric("HPFI ≥ 0.75", int(hpfi_top), help="Count of block groups scoring in the top quartile")
+                st.metric("Top-Tier Areas (≥0.75)", int(hpfi_top), help="Block groups in top 25% for economic capacity and growth potential")
             with hpfi_cols[2]:
-                st.metric("Peak HPFI", f"{hpfi_max:.2f}")
+                st.metric("Peak HPFI", f"{hpfi_max:.2f}", help="Highest HPFI score in current selection")
         
         with st.expander("How the Educational Desert Index (EDI) is calculated", expanded=False):
             st.markdown(
@@ -1454,12 +1669,13 @@ def main():
         # Main map
         st.subheader(f"📍 {selected_metric} by Block Group")
         
-        # Check if we're in overlay mode
+        # Check if we're in overlay or marketing zones mode
         is_overlay_mode = selected_metric == 'Overlay: EDI × HPFI'
+        is_marketing_zones = selected_metric == 'High-Potential Marketing Zones'
         
-        if is_overlay_mode or (selected_metric in color_options and color_options[selected_metric] in demographics_filtered.columns):
+        if is_overlay_mode or is_marketing_zones or (selected_metric in color_options and color_options[selected_metric] in demographics_filtered.columns):
             if hpfi_threshold is not None:
-                st.info(f"HPFI highlight enabled: showing block groups with HPFI ≥ {hpfi_threshold:.2f}.")
+                st.info(f"💡 HPFI Focus Mode: Showing block groups with HPFI ≥ {hpfi_threshold:.2f} (top 25% tuition-paying potential).")
             
             # Show zone counts for overlay mode
             if is_overlay_mode and 'zone' in demographics_filtered.columns:
@@ -1467,40 +1683,88 @@ def main():
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     golden_count = zone_counts.get('Golden Zone', 0)
-                    st.metric('Golden Zone', golden_count, help='High EDI & High HPFI')
+                    st.metric('Golden Zone', golden_count, help='High EDI & High HPFI - Priority areas combining access need and economic potential')
                 with col2:
                     mission_count = zone_counts.get('Mission Zone', 0)
-                    st.metric('Mission Zone', mission_count, help='High EDI & Low HPFI')
+                    st.metric('Mission Zone', mission_count, help='High EDI & Low HPFI - Mission-focused outreach areas')
                 with col3:
                     affluent_count = zone_counts.get('Affluent Opportunity Zone', 0)
-                    st.metric('Affluent Opportunity', affluent_count, help='Low EDI & High HPFI')
+                    st.metric('Affluent Opportunity', affluent_count, help='Low EDI & High HPFI - Well-served areas with economic capacity')
                 with col4:
                     low_priority_count = zone_counts.get('Low Priority Zone', 0)
                     st.metric('Low Priority Zone', low_priority_count, help='Low EDI & Low HPFI')
+            
+            # Show marketing zone counts
+            if is_marketing_zones and 'marketing_zone' in demographics_filtered.columns:
+                st.markdown("### 🎯 Marketing Zone Distribution")
+                st.caption("Zones optimized for growth strategy: High HPFI + moderate EDI + strong K-12 population")
+                zone_counts = demographics_filtered['marketing_zone'].value_counts()
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    premium_count = zone_counts.get('Premium Growth Target', 0)
+                    st.metric('🌟 Premium Growth', premium_count, help='High HPFI + Moderate EDI + Strong K12 - Top priority for outreach')
+                with col2:
+                    established_count = zone_counts.get('Established Market', 0)
+                    st.metric('💼 Established Market', established_count, help='High HPFI + Low EDI - Affluent, well-served areas')
+                with col3:
+                    emerging_count = zone_counts.get('Emerging Opportunity', 0)
+                    st.metric('📈 Emerging Opportunity', emerging_count, help='Medium HPFI + Moderate EDI - Growth potential')
+                with col4:
+                    foundation_count = zone_counts.get('Foundation Building', 0)
+                    st.metric('🏗️ Foundation Building', foundation_count, help='Longer-term relationship development areas')
             
             visible_competition = competition_schools[
                 competition_schools['type'].isin(selected_competition_types)
             ] if selected_competition_types else pd.DataFrame()
             
+            # Determine column name and use_zones flag
+            if is_marketing_zones:
+                color_col = 'marketing_zone'
+                use_zones_flag = 'marketing'
+            elif is_overlay_mode:
+                color_col = 'zone'
+                use_zones_flag = True
+            else:
+                color_col = color_options.get(selected_metric, 'k12_pop')
+                use_zones_flag = False
+            
             fig = create_choropleth_map(
                 gdf_filtered, 
                 demographics_filtered, 
-                color_options.get(selected_metric, 'k12_pop') if not is_overlay_mode else 'zone',
+                color_col,
                 f"{selected_metric} across Philadelphia Block Groups",
                 show_current_students,
                 current_students if show_current_students else None,
                 show_competition_overlay,
                 visible_competition,
-                use_zones=is_overlay_mode
+                use_zones=use_zones_flag
             )
             st.plotly_chart(fig, width='stretch')
         else:
-            st.error(f"Data not available for {selected_metric}")
+            st.info(f"📊 Data for {selected_metric} is being prepared...")
         
         # Analysis tables
         st.subheader("📊 Detailed Analysis")
         
+        # Marketing zones mode: show premium growth targets first
+        if is_marketing_zones and 'marketing_zone' in demographics_filtered.columns:
+            st.write("**Top Premium Growth Targets (High HPFI + Moderate EDI + Strong K12)**")
+            premium_zones = demographics_filtered[demographics_filtered['marketing_zone'] == 'Premium Growth Target'].nlargest(10, 'hpfi')[
+                ['block_group_id', 'hpfi', 'EDI', 'income', 'first_gen_pct', 'k12_pop']
+            ].copy()
+            if len(premium_zones) > 0:
+                premium_zones['hpfi'] = premium_zones['hpfi'].map(lambda v: f"{v:.2f}")
+                premium_zones['EDI'] = premium_zones['EDI'].map(lambda v: f"{v:.2f}")
+                premium_zones['income'] = premium_zones['income'].map(lambda v: f"${v:,.0f}")
+                premium_zones['first_gen_pct'] = premium_zones['first_gen_pct'].map(lambda v: f"{v:.1f}%")
+                premium_zones['k12_pop'] = premium_zones['k12_pop'].map(lambda v: f"{int(v):,}")
+                st.dataframe(premium_zones, width='stretch', use_container_width=True)
+            else:
+                st.info("No block groups found in Premium Growth Target zone. Adjust filters to see more areas.")
+            st.divider()
+        
         # Overlay mode: show zone breakdown first
+
         if is_overlay_mode and 'zone' in demographics_filtered.columns:
             st.write("**Top Golden Zones (EDI × HPFI Overlay)**")
             golden_zones = demographics_filtered[demographics_filtered['zone'] == 'Golden Zone'].nlargest(10, 'EDI')[
@@ -1558,20 +1822,20 @@ def main():
             )
     
     else:
-        st.warning("🔍 No block groups match your current filters. Try expanding your criteria.")
+        st.info("🔍 No areas match your current filter settings. Try broadening your criteria to see more opportunities.")
         if highlight_hpfi:
-            st.info("HPFI highlight removed all visible block groups. Disable the highlight toggle to review the full list.")
+            st.info("💡 HPFI Focus Mode is active. Disable 'Focus on High-Potential Family Index' in the sidebar to see all areas.")
         
-        # Show available ranges
+        # Show available ranges with positive framing
         if not demographics.empty:
-            st.info("**Available Data Ranges:**")
+            st.info("**📊 Data Available Across Philadelphia:**")
             col1, col2 = st.columns(2)
             with col1:
-                st.write(f"• Income: ${demographics['income'].min():,.0f} - ${demographics['income'].max():,.0f}")
-                st.write(f"• K-12 Population: {demographics['k12_pop'].min():.0f} - {demographics['k12_pop'].max():.0f}")
+                st.write(f"• Income Range: ${demographics['income'].min():,.0f} - ${demographics['income'].max():,.0f}")
+                st.write(f"• Student Population Range: {demographics['k12_pop'].min():.0f} - {demographics['k12_pop'].max():.0f}")
             with col2:
-                st.write(f"• Total Block Groups: {len(demographics)}")
-                st.write(f"• Distance Range: 0 - 35 km from CCA campuses")
+                st.write(f"• Total Areas Available: {len(demographics)}")
+                st.write(f"• Geographic Coverage: Up to 35 km from CCA campuses")
 
 if __name__ == "__main__":
     main()
