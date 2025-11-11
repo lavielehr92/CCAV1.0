@@ -960,8 +960,7 @@ def create_choropleth_map(
                     size=14,
                     symbol='diamond',
                     color=comp_valid['color'].tolist(),
-                    opacity=0.95,
-                    line=dict(width=2, color='white')
+                    opacity=0.95
                 ),
                 customdata=custom_valid,
                 hovertemplate=(
