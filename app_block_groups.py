@@ -1041,24 +1041,30 @@ def main():
         st.markdown("""
         ### What EDI Measures
 
-        The Educational Desert Index identifies neighborhoods with **limited access to quality educational infrastructure**. Unlike proximity-based measures, EDI considers distance to ANY quality school (public, private, charter), available seats, socioeconomic barriers, and estimated internet access.
+        The Educational Desert Index uses **rigorous 2-Step Floating Catchment Area (2SFCA) analysis** to identify neighborhoods with limited access to quality educational infrastructure. This is the same methodology used in academic research for healthcare access and food deserts.
 
         **Higher EDI scores = worse educational environment** (true educational deserts).
 
-        #### How We Calculate It
-        1. **Accessibility (40%)** – Distance to the nearest quality school. Farther distances increase EDI.
-        2. **Seat Availability (30%)** – Ratio of total nearby school seats to K-12 population. Fewer seats per student increases EDI.
-        3. **Socioeconomic Barriers (20%)** – Poverty rate. Higher poverty increases EDI.
-        4. **Infrastructure (10%)** – Estimated broadband access (proxy via inverse poverty). Lower access increases EDI.
+        #### How We Calculate It (2SFCA Method)
+        1. **Accessibility (40%)** – Uses gravity-weighted school access model. Nearby schools count more than distant ones due to exponential distance decay (β=5km). Measures actual capacity availability, not just proximity.
+        2. **School-to-Student Ratio (30%)** – Local capacity vs K-12 population using gravity-weighted catchment areas. Accounts for overcrowding and shared demand.
+        3. **Socioeconomic Need (20%)** – Combines poverty rate (70%) and % adults without HS diploma (30%). Real barriers to educational access.
+        4. **Infrastructure (10%)** – Estimated broadband access (proxy via inverse poverty). Technology access for remote learning.
 
-        Each component is scaled 0–1 and combined into a 0–100 score.
+        Each component is normalized 0–1 and weighted, then scaled to 0–100.
+
+        #### Why 2SFCA is Better
+        - **Prevents edge effects**: Distant mega-schools don't dominate scores
+        - **Gravity decay**: Schools 1km away count far more than schools 10km away
+        - **True crowding**: Measures seats-per-weighted-student, not simple ratios
+        - **Research-validated**: Standard method in spatial accessibility analysis
 
         #### Reading the Score
-        - **70–100** → True educational deserts with limited school access, few seats, high poverty, poor infrastructure.
-        - **40–69** → Moderate educational challenges; some infrastructure gaps.
-        - **0–39** → Well-served communities with good school access, sufficient capacity, better infrastructure.
+        - **70–100** → True educational deserts: far from schools, overcrowded, high poverty, poor infrastructure
+        - **40–69** → Moderate challenges: some gaps in access or capacity
+        - **0–39** → Well-served: good school access, sufficient seats, better infrastructure
 
-        Use EDI to identify underserved areas where CCA can make the greatest impact by filling real educational gaps.
+        Use EDI to identify underserved areas where CCA can fill real educational infrastructure gaps.
         """)
     
     # Load data
@@ -1615,16 +1621,26 @@ def main():
         with st.expander("How the Educational Desert Index (EDI) is calculated", expanded=False):
             st.markdown(
                 """
-                **Four components (scaled 0-1) feed the composite score:**
+                **Rigorous 2-Step Floating Catchment Area (2SFCA) Analysis:**
 
-                1. **Accessibility (40%)** – Distance to the nearest quality school (public, private, charter). Normalized from 0-15km. Farther = higher EDI.
-                2. **Seat Availability (30%)** – Ratio of total nearby school seats (within catchment area) to K-12 population. Fewer seats per student = higher EDI.
-                3. **Socioeconomic Barriers (20%)** – Poverty rate from Census data. Higher poverty = higher EDI.
-                4. **Infrastructure (10%)** – Estimated broadband access (proxy using inverse of poverty rate). Lower access = higher EDI.
-
-                EDI = (0.40 × accessibility) + (0.30 × seat_ratio) + (0.20 × poverty) + (0.10 × infrastructure), scaled 0–100.
+                **Step 1:** For each school, calculate gravity-weighted demand in its catchment:
+                - R_j = seats_j / Σ(pop_i × w(d_ij)) where w(d) = exp(-d/5km)
                 
-                **Higher EDI = true educational desert** (far from schools, low capacity, high poverty, poor infrastructure).
+                **Step 2:** For each block group, sum accessibility from all schools:
+                - A_i = Σ(R_j × w(d_ij)) = aggregate capacity-to-demand ratio
+                
+                **Four components (each 0-1, higher = worse):**
+
+                1. **Accessibility (40%)** – Inverse of 2SFCA accessibility score. Accounts for distance decay and competing demand. Lower A_i = higher EDI.
+                2. **Seat Ratio (30%)** – Gravity-weighted local seats / K-12 population. Measures true overcrowding with shared catchments.
+                3. **Need (20%)** – Poverty rate (70%) + % adults without HS diploma (30%). Socioeconomic barriers to education.
+                4. **Infrastructure (10%)** – Estimated broadband access (inverse poverty proxy). Technology access for remote learning.
+
+                **Final EDI** = (0.40×access + 0.30×ratio + 0.20×need + 0.10×infra), scaled 0–100.
+                
+                **Higher EDI = true educational desert** (poor access, overcrowded, high barriers, low infrastructure).
+                
+                *2SFCA prevents distant schools from dominating scores and accounts for competing demand across overlapping catchments.*
                 """
             )
 
