@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 import geopandas as gpd
 import json
 import os
+from pathlib import Path
 import requests
 from typing import Tuple
 from educational_desert_index_bg import compute_edi_block_groups, haversine_km
@@ -56,15 +57,28 @@ except Exception:
 
 STATE_FIPS = "42"  # Pennsylvania
 COUNTY_FIPS = "101"  # Philadelphia County
-ACS_YEAR = "2022"
+ACS_YEAR = "2023"
 ACS_ACS5_ENDPOINT = f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5"
-K12_ENROLLMENT_VARS = {
-    "B14007_001E": "enrolled_total",
-    "B14007_002E": "enrolled_k",
-    "B14007_003E": "enrolled_1_4",
-    "B14007_004E": "enrolled_5_8",
-    "B14007_005E": "enrolled_9_12",
+ACS_SUBJECT_ENDPOINT = f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5/subject"
+
+BG_AGE_FIELDS = {
+    "B01001_004E": "male_5_9",
+    "B01001_005E": "male_10_14",
+    "B01001_006E": "male_15_17",
+    "B01001_028E": "female_5_9",
+    "B01001_029E": "female_10_14",
+    "B01001_030E": "female_15_17",
 }
+
+TRACT_ENROLLMENT_FIELDS = {
+    # per ACS S1401 documentation: kindergarten, grades 1-8, grades 9-12 enrollment counts
+    "S1401_C01_004E": "kindergarten_total",
+    "S1401_C01_005E": "grades_1_to_8_total",
+    "S1401_C01_006E": "grades_9_to_12_total",
+}
+
+DATA_CACHE_DIR = Path("data/cache")
+DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Helper function to get Census API key from multiple sources
 def get_census_api_key():
@@ -97,63 +111,208 @@ def get_census_api_key():
     return None
 
 
-@st.cache_data(ttl=86400)
-def fetch_k12_enrollment_from_census() -> Tuple[pd.DataFrame, dict]:
-    """Pull ACS B14007 enrollment counts for all Philadelphia block groups."""
-
-    params = {
-        "get": ",".join(K12_ENROLLMENT_VARS.keys()),
-        "for": "block group:*",
-        "in": f"state:{STATE_FIPS} county:{COUNTY_FIPS}",
-    }
+def _acs_request(url: str, params: dict) -> list:
     api_key = get_census_api_key()
     if api_key:
-        params["key"] = api_key
-
-    response = requests.get(ACS_ACS5_ENDPOINT, params=params, timeout=60)
+        params = {**params, "key": api_key}
+    response = requests.get(url, params=params, timeout=60)
     response.raise_for_status()
-    payload = response.json()
-    headers = payload[0]
+    return response.json()
 
-    expected_columns = list(K12_ENROLLMENT_VARS.keys()) + ["state", "county", "tract", "block group"]
-    missing_columns = [col for col in expected_columns if col not in headers]
-    if missing_columns:
-        raise ValueError(
-            "Missing required ACS variables: " + ", ".join(missing_columns)
-        )
+
+@st.cache_data(ttl=86400)
+def fetch_block_group_age_data() -> Tuple[pd.DataFrame, dict]:
+    """Retrieve ACS block-group counts for population age 5-17."""
+
+    params = {
+        "get": ",".join(list(BG_AGE_FIELDS.keys()) + ["NAME"]),
+        "for": "block group:*",
+        "in": f"state:{STATE_FIPS}+county:{COUNTY_FIPS}+tract:*",
+    }
+    payload = _acs_request(ACS_ACS5_ENDPOINT, params)
+    headers = payload[0]
+    expected = list(BG_AGE_FIELDS.keys()) + ["NAME", "state", "county", "tract", "block group"]
+    missing = [col for col in expected if col not in headers]
+    if missing:
+        raise ValueError(f"Missing required ACS variables for block group ages: {', '.join(missing)}")
 
     df = pd.DataFrame(payload[1:], columns=headers)
     df["block_group_id"] = df["state"] + df["county"] + df["tract"] + df["block group"]
+    df["tract_id"] = df["state"] + df["county"] + df["tract"]
 
-    for code, label in K12_ENROLLMENT_VARS.items():
-        df[label] = pd.to_numeric(df[code], errors="coerce")
+    for code, alias in BG_AGE_FIELDS.items():
+        df[alias] = pd.to_numeric(df[code], errors="coerce")
 
-    component_labels = [
-        K12_ENROLLMENT_VARS["B14007_002E"],
-        K12_ENROLLMENT_VARS["B14007_003E"],
-        K12_ENROLLMENT_VARS["B14007_004E"],
-        K12_ENROLLMENT_VARS["B14007_005E"],
-    ]
-    df["k12_pop_enrolled"] = df[component_labels].fillna(0).sum(axis=1)
-    df["k12_components_missing"] = df[component_labels].isna().any(axis=1)
+    df["bg_age_5_17"] = df[list(BG_AGE_FIELDS.values())].fillna(0).sum(axis=1)
+    df["is_modeled"] = True
 
-    total_k12 = float(df["k12_pop_enrolled"].sum())
-    total_blocks = len(df)
-    flagged = int(df["k12_components_missing"].sum())
-    print(
-        f"[ACS] Retrieved {total_blocks} block groups from B14007. "
-        f"Total enrolled K-12 students: {total_k12:,.0f}. "
-        f"Component gaps: {flagged}."
-    )
+    timestamp = pd.Timestamp.utcnow().isoformat()
+    cache_path = DATA_CACHE_DIR / f"bg_age_{ACS_YEAR}.csv"
+    df.to_csv(cache_path, index=False)
 
     summary = {
-        "block_groups": total_blocks,
-        "k12_total": total_k12,
-        "component_gaps": flagged,
+        "timestamp": timestamp,
+        "records": len(df),
+    }
+    cols_to_return = ["block_group_id", "tract_id", "bg_age_5_17", "is_modeled"]
+    return df[cols_to_return], summary
+
+
+@st.cache_data(ttl=86400)
+def fetch_tract_enrollment_data() -> Tuple[pd.DataFrame, dict]:
+    """Retrieve ACS tract-level enrollment totals and compute K-12 rates."""
+
+    # Enrollment counts from S1401 (kindergarten, grades 1-8, grades 9-12)
+    enrollment_params = {
+        "get": ",".join(list(TRACT_ENROLLMENT_FIELDS.keys()) + ["NAME"]),
+        "for": "tract:*",
+        "in": f"state:{STATE_FIPS}+county:{COUNTY_FIPS}",
+    }
+    enrollment_payload = _acs_request(ACS_SUBJECT_ENDPOINT, enrollment_params)
+    enrollment_headers = enrollment_payload[0]
+    expected_enrollment = list(TRACT_ENROLLMENT_FIELDS.keys()) + ["NAME", "state", "county", "tract"]
+    missing_enrollment = [col for col in expected_enrollment if col not in enrollment_headers]
+    if missing_enrollment:
+        raise ValueError(
+            "Missing S1401 enrollment variables: " + ", ".join(missing_enrollment)
+        )
+
+    enrollment_df = pd.DataFrame(enrollment_payload[1:], columns=enrollment_headers)
+    enrollment_df["tract_id"] = enrollment_df["state"] + enrollment_df["county"] + enrollment_df["tract"]
+
+    for code, alias in TRACT_ENROLLMENT_FIELDS.items():
+        enrollment_df[alias] = pd.to_numeric(enrollment_df[code], errors="coerce")
+
+    enrollment_df["tract_enrolled_k12"] = (
+        enrollment_df["kindergarten_total"].fillna(0)
+        + enrollment_df["grades_1_to_8_total"].fillna(0)
+        + enrollment_df["grades_9_to_12_total"].fillna(0)
+    )
+
+    # Tract population age 5-17 from B01001
+    tract_params = {
+        "get": ",".join(list(BG_AGE_FIELDS.keys()) + ["NAME"]),
+        "for": "tract:*",
+        "in": f"state:{STATE_FIPS}+county:{COUNTY_FIPS}",
+    }
+    tract_payload = _acs_request(ACS_ACS5_ENDPOINT, tract_params)
+    tract_headers = tract_payload[0]
+    expected_tract = list(BG_AGE_FIELDS.keys()) + ["NAME", "state", "county", "tract"]
+    missing_tract = [col for col in expected_tract if col not in tract_headers]
+    if missing_tract:
+        raise ValueError(f"Missing tract B01001 variables: {', '.join(missing_tract)}")
+
+    tract_df = pd.DataFrame(tract_payload[1:], columns=tract_headers)
+    tract_df["tract_id"] = tract_df["state"] + tract_df["county"] + tract_df["tract"]
+    for code, alias in BG_AGE_FIELDS.items():
+        tract_df[alias] = pd.to_numeric(tract_df[code], errors="coerce")
+    tract_df["tract_pop_5_17"] = tract_df[list(BG_AGE_FIELDS.values())].fillna(0).sum(axis=1)
+
+    combined = enrollment_df.merge(tract_df[["tract_id", "tract_pop_5_17"]], on="tract_id", how="left")
+    combined["tract_pop_5_17"] = combined["tract_pop_5_17"].fillna(0)
+    combined["tract_rate_k12"] = combined.apply(
+        lambda row: 0.0 if row["tract_pop_5_17"] <= 0 else row["tract_enrolled_k12"] / row["tract_pop_5_17"],
+        axis=1
+    )
+
+    timestamp = pd.Timestamp.utcnow().isoformat()
+    cache_path = DATA_CACHE_DIR / f"tract_enrollment_{ACS_YEAR}.csv"
+    combined.to_csv(cache_path, index=False)
+
+    summary = {
+        "timestamp": timestamp,
+        "records": len(combined),
     }
 
-    cols_to_return = ["block_group_id", "k12_pop_enrolled", "k12_components_missing"] + component_labels
-    return df[cols_to_return], summary
+    cols = [
+        "tract_id",
+        "tract_enrolled_k12",
+        "tract_pop_5_17",
+        "tract_rate_k12",
+    ]
+    return combined[cols], summary
+
+
+def validate_k12_total(demographics: pd.DataFrame, tract_enrollment_data: pd.DataFrame) -> dict:
+    """
+    Validate K-12 total against expected range (200k-260k).
+    Return validation result with warnings if out of range.
+    """
+    total = float(demographics['k12_pop'].sum())
+    min_expected = 200000.0
+    max_expected = 260000.0
+    
+    result = {
+        'total': total,
+        'is_valid': min_expected <= total <= max_expected,
+        'min_expected': min_expected,
+        'max_expected': max_expected,
+        'warnings': []
+    }
+    
+    if total < min_expected:
+        result['warnings'].append(
+            f"⚠️ K-12 total ({total:,.0f}) is below expected minimum ({min_expected:,.0f})."
+        )
+        # Show top 5 tracts by lowest rate
+        tract_enrollment_data_sorted = tract_enrollment_data.sort_values('tract_rate_k12').head(5)
+        result['low_tracts'] = tract_enrollment_data_sorted[['tract_id', 'tract_rate_k12', 'tract_enrolled_k12', 'tract_pop_5_17']].copy()
+    
+    elif total > max_expected:
+        result['warnings'].append(
+            f"⚠️ K-12 total ({total:,.0f}) exceeds expected maximum ({max_expected:,.0f})."
+        )
+        # Show top 5 tracts by highest rate
+        tract_enrollment_data_sorted = tract_enrollment_data.sort_values('tract_rate_k12', ascending=False).head(5)
+        result['high_tracts'] = tract_enrollment_data_sorted[['tract_id', 'tract_rate_k12', 'tract_enrolled_k12', 'tract_pop_5_17']].copy()
+    
+    else:
+        result['messages'] = [f"✅ K-12 total ({total:,.0f}) is within expected range ({min_expected:,.0f}–{max_expected:,.0f})."]
+    
+    return result
+
+
+def compute_edi_hpfi_zones(demographics: pd.DataFrame, edi_col: str = "EDI", hpfi_col: str = "hpfi") -> pd.DataFrame:
+    """
+    Create 4-zone overlay using 75th percentile thresholds for EDI and HPFI.
+    
+    Zones:
+    - Golden Zone: high EDI & high HPFI
+    - Mission Zone: high EDI & low HPFI
+    - Affluent Opportunity Zone: low EDI & high HPFI
+    - Low Priority Zone: low EDI & low HPFI
+    """
+    working = demographics.copy()
+    
+    # Ensure numeric
+    working[edi_col] = pd.to_numeric(working.get(edi_col), errors='coerce').fillna(0)
+    working[hpfi_col] = pd.to_numeric(working.get(hpfi_col), errors='coerce').fillna(0)
+    
+    # Compute quantiles
+    edi_75 = working[edi_col].quantile(0.75)
+    hpfi_75 = working[hpfi_col].quantile(0.75)
+    
+    edi_high = working[edi_col] >= edi_75
+    hpfi_high = working[hpfi_col] >= hpfi_75
+    
+    def classify_zone(edi_h, hpfi_h):
+        if edi_h and hpfi_h:
+            return 'Golden Zone'
+        elif edi_h and not hpfi_h:
+            return 'Mission Zone'
+        elif not edi_h and hpfi_h:
+            return 'Affluent Opportunity Zone'
+        else:
+            return 'Low Priority Zone'
+    
+    working['zone'] = [classify_zone(e, h) for e, h in zip(edi_high, hpfi_high)]
+    
+    # Store thresholds as metadata
+    working['_edi_75_threshold'] = edi_75
+    working['_hpfi_75_threshold'] = hpfi_75
+    
+    return working
+
 
 # Page config
 st.set_page_config(
@@ -238,7 +397,7 @@ def compute_hpfi_scores(df: pd.DataFrame, edi_col: str = "EDI") -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)  # Cache for 1 hour, then reload
 def load_block_group_data():
-    """Load block group geometries and enrich demographics with ACS enrollment."""
+    """Load block group geometries and enrich demographics with modeled ACS enrollment."""
 
     try:
         gdf = gpd.read_file('philadelphia_block_groups.geojson')
@@ -270,28 +429,25 @@ def load_block_group_data():
         demographics['k12_pop_legacy'] = pd.NA
 
     try:
-        k12_df, k12_summary = fetch_k12_enrollment_from_census()
+        bg_age_df, bg_meta = fetch_block_group_age_data()
+        tract_enrollment_df, tract_meta = fetch_tract_enrollment_data()
     except Exception as exc:
         raise RuntimeError(
-            "Unable to retrieve ACS B14007 enrollment data. Provide a valid CENSUS_API_KEY and internet access."
+            "Unable to retrieve ACS 2023 B01001/S1401 data. Provide a valid CENSUS_API_KEY and internet access."
         ) from exc
 
-    demographics = demographics.merge(
-        k12_df[['block_group_id', 'k12_pop_enrolled', 'k12_components_missing']],
-        on='block_group_id',
-        how='left'
-    )
+    demographics = demographics.merge(bg_age_df, on='block_group_id', how='left')
+    demographics['tract_id'] = demographics['block_group_id'].str.slice(0, 11)
+    demographics = demographics.merge(tract_enrollment_df, on='tract_id', how='left')
 
-    demographics['k12_imputed'] = demographics['k12_pop_enrolled'].isna() | demographics['k12_components_missing']
-    demographics['k12_pop'] = demographics['k12_pop_enrolled'].fillna(0)
+    missing_mask = demographics['tract_rate_k12'].isna() | demographics['bg_age_5_17'].isna()
+    demographics['bg_age_5_17'] = demographics['bg_age_5_17'].fillna(0)
+    demographics['tract_rate_k12'] = demographics['tract_rate_k12'].fillna(0)
+    demographics['bg_enrolled_k12'] = (demographics['bg_age_5_17'] * demographics['tract_rate_k12']).clip(lower=0)
+    demographics['k12_pop'] = demographics['bg_enrolled_k12'].round(0)
+    demographics['is_modeled'] = True
+    demographics['k12_imputed'] = False
 
-    negative_mask = demographics['k12_pop'] < 0
-    if negative_mask.any():
-        print(f"[QA] Resetting {negative_mask.sum()} negative K-12 values to 0.")
-        demographics.loc[negative_mask, 'k12_pop'] = 0
-        demographics.loc[negative_mask, 'k12_imputed'] = True
-
-    missing_mask = demographics['k12_pop'].isna()
     if missing_mask.any():
         demographics.loc[missing_mask, 'k12_pop'] = 0
         demographics.loc[missing_mask, 'k12_imputed'] = True
@@ -301,12 +457,13 @@ def load_block_group_data():
         'k12_total': float(demographics['k12_pop'].sum()),
         'legacy_k12_total': float(legacy_total) if pd.notna(legacy_total) else None,
         'imputed_count': int(demographics['k12_imputed'].sum()),
-        'component_gaps': int(k12_summary.get('component_gaps', 0)),
+        'bg_cache_timestamp': bg_meta.get('timestamp'),
+        'tract_cache_timestamp': tract_meta.get('timestamp'),
     }
 
     print(
         f"[QA] Block groups loaded: {demos_summary['block_groups']}. "
-        f"K-12 enrolled students: {demos_summary['k12_total']:,.0f}. "
+        f"ACS {ACS_YEAR} modeled K-12: {demos_summary['k12_total']:,.0f}. "
         f"Imputed block groups: {demos_summary['imputed_count']}."
     )
 
@@ -329,9 +486,14 @@ def create_choropleth_map(
     show_students=False,
     students_df=None,
     show_competition=False,
-    competition_df=None
+    competition_df=None,
+    use_zones=False
 ):
-    """Create choropleth map with block group boundaries"""
+    """Create choropleth map with block group boundaries.
+    
+    Args:
+        use_zones: If True, color by 'zone' column with 4-category scheme.
+    """
     
     # Debug output
     st.sidebar.write(f"🔍 Debug: Creating map with {len(gdf_filtered)} geographic features")
@@ -357,8 +519,13 @@ def create_choropleth_map(
         st.error("❌ No data to display on map after filtering!")
         return go.Figure()
     
-    # Check if color_column exists
-    if color_column not in plot_data.columns:
+    # Check if color_column or zone column exists
+    if use_zones:
+        if 'zone' not in plot_data.columns:
+            st.error("Zone column not found. Cannot create overlay map.")
+            return go.Figure()
+        color_column = 'zone'
+    elif color_column not in plot_data.columns:
         st.warning(f"⚠️ Column '{color_column}' not found. Available columns: {list(plot_data.columns)}")
         # Use a default column
         if 'k12_pop' in plot_data.columns:
@@ -387,10 +554,15 @@ def create_choropleth_map(
             feature['properties']['poverty_rate'] = 0.0 if pd.isna(poverty_val) else float(poverty_val)
             if color_column in row:
                 color_val = row.get(color_column, np.nan)
-                feature['properties'][color_column] = 0.0 if pd.isna(color_val) else float(color_val)
+                if use_zones:
+                    feature['properties'][color_column] = str(color_val) if pd.notna(color_val) else 'Unknown'
+                else:
+                    feature['properties'][color_column] = 0.0 if pd.isna(color_val) else float(color_val)
     
     # Build custom hover template with proper formatting for missing data
     hover_template = '<b>Block Group: %{customdata[0]}</b><br>'
+    if use_zones:
+        hover_template += 'Zone: %{customdata[6]}<br>'
     hover_template += 'EDI: %{customdata[1]}<br>'
     hover_template += 'Median Income: %{customdata[2]}<br>'
     hover_template += 'First-Gen %: %{customdata[3]}<br>'
@@ -400,25 +572,44 @@ def create_choropleth_map(
     # Prepare custom data for hover with proper formatting
     cleaned = plot_data.copy()
 
-    numeric_cols = ['income', 'first_gen_pct', 'k12_pop', 'hpfi', 'EDI', color_column]
+    numeric_cols = ['income', 'first_gen_pct', 'k12_pop', 'hpfi', 'EDI']
+    if not use_zones:
+        numeric_cols.append(color_column)
+    
     for col in numeric_cols:
         if col in cleaned.columns:
             cleaned[col] = cleaned[col].replace(-666666666, np.nan)
             cleaned[col] = pd.to_numeric(cleaned[col], errors='coerce')
 
-    z_series = cleaned[color_column] if color_column in cleaned.columns else pd.Series(np.nan, index=cleaned.index)
-    if z_series.isna().all():
-        fallback_col = 'k12_pop' if 'k12_pop' in cleaned.columns else None
-        if fallback_col:
-            st.warning(f"No valid values in '{color_column}' to color by; falling back to '{fallback_col}'.")
-            color_column = fallback_col
-            if color_column in cleaned.columns:
-                z_series = pd.to_numeric(cleaned[color_column], errors='coerce')
-        else:
-            st.error("No valid data available for coloring the map.")
-            return go.Figure()
-
-    z_vals = z_series.fillna(0).astype(float).values
+    # Handle zone-based coloring
+    if use_zones:
+        zone_map = {
+            'Golden Zone': 0,
+            'Mission Zone': 1,
+            'Affluent Opportunity Zone': 2,
+            'Low Priority Zone': 3
+        }
+        z_vals = cleaned['zone'].map(zone_map).fillna(3).astype(int).values
+        colorscale = [
+            [0.0, '#00B050'],     # Golden Zone - green
+            [0.33, '#FFC000'],    # Mission Zone - gold
+            [0.67, '#0070C0'],    # Affluent Opportunity - blue
+            [1.0, '#C00000']      # Low Priority - red
+        ]
+    else:
+        z_series = cleaned[color_column] if color_column in cleaned.columns else pd.Series(np.nan, index=cleaned.index)
+        if z_series.isna().all():
+            fallback_col = 'k12_pop' if 'k12_pop' in cleaned.columns else None
+            if fallback_col:
+                st.warning(f"No valid values in '{color_column}' to color by; falling back to '{fallback_col}'.")
+                color_column = fallback_col
+                if color_column in cleaned.columns:
+                    z_series = pd.to_numeric(cleaned[color_column], errors='coerce')
+            else:
+                st.error("No valid data available for coloring the map.")
+                return go.Figure()
+        z_vals = z_series.fillna(0).astype(float).values
+        colorscale = "RdYlBu_r"
 
     # Helper function to format values for display
     def format_value(row, col, format_type='number'):
@@ -440,6 +631,7 @@ def create_choropleth_map(
     # Create formatted customdata
     customdata_list = []
     for _, row in cleaned.iterrows():
+        zone_val = str(row.get('zone', 'Unknown')) if use_zones else ''
         customdata_list.append([
             str(row.get('block_group_id', 'N/A')),
             format_value(row, 'EDI', 'number'),
@@ -447,12 +639,29 @@ def create_choropleth_map(
             format_value(row, 'first_gen_pct', 'percent'),
             format_value(row, 'k12_pop', 'integer'),
             format_value(row, 'hpfi', 'hpfi'),
+            zone_val,
         ])
 
     customdata = np.array(customdata_list)
     
     # Create the choropleth using graph_objects for better control
     fig = go.Figure()
+    
+    # Prepare colorbar based on mode
+    if use_zones:
+        colorbar = dict(
+            title='Zone',
+            tickvals=[0, 1, 2, 3],
+            ticktext=['Golden', 'Mission', 'Affluent', 'Low Priority'],
+            len=0.7,
+            x=1.02
+        )
+    else:
+        colorbar = dict(
+            title=color_column.replace('_', ' ').title(),
+            len=0.7,
+            x=1.02
+        )
     
     # Add choropleth trace
     fig.add_choroplethmapbox(
@@ -461,19 +670,15 @@ def create_choropleth_map(
         z=z_vals,
         featureidkey="id",  # Link to the 'id' we set in the GeoJSON features
         customdata=customdata,
-        colorscale="RdYlBu_r",
+        colorscale=colorscale,
         marker_opacity=0.7,
         marker_line_width=1,
         marker_line_color='white',
         hovertemplate=hover_template,
-        colorbar=dict(
-            title=color_column.replace('_', ' ').title(),
-            len=0.7,
-            x=1.02
-        ),
+        colorbar=colorbar,
         showscale=True
     )
-    
+
     # Compute bounds and center for auto-fit
     try:
         # Ensure CRS is WGS84
@@ -607,11 +812,11 @@ def create_choropleth_map(
             lon=comp_copy['lon'],
             mode='markers',
             marker=dict(
-                size=18,
+                size=14,
                 symbol='diamond',
                 color=comp_copy['color'],
                 opacity=0.95,
-                line=dict(width=2, color='#111111')
+                line=dict(width=2, color='white')
             ),
             customdata=custom_comp,
             hovertemplate=(
@@ -623,7 +828,8 @@ def create_choropleth_map(
                 "Address: %{customdata[5]}<br>"
                 "%{customdata[6]}<extra></extra>"
             ),
-            name='Competition Schools'
+            name='Competitor Schools',
+            zorder=10
         )
     
     return fig
@@ -715,25 +921,46 @@ def main():
     with st.spinner("Loading Census block group data..."):
         try:
             gdf, demographics, k12_summary = load_block_group_data()
+            # Also fetch tract data for validation
+            tract_enrollment_data, _ = fetch_tract_enrollment_data()
         except RuntimeError as exc:
             st.error(str(exc))
             st.stop()
         current_students = load_current_students()
 
+    # Validate K-12 total
+    validation_result = validate_k12_total(demographics, tract_enrollment_data)
+    
+    if not validation_result['is_valid']:
+        with st.error("⚠️ K-12 Enrollment Validation Warning"):
+            st.write(validation_result['warnings'][0])
+            if 'low_tracts' in validation_result:
+                st.write("**Tracts with lowest enrollment rates:**")
+                st.dataframe(validation_result['low_tracts'], use_container_width=True)
+            elif 'high_tracts' in validation_result:
+                st.write("**Tracts with highest enrollment rates:**")
+                st.dataframe(validation_result['high_tracts'], use_container_width=True)
+    else:
+        if validation_result.get('messages'):
+            st.success(validation_result['messages'][0])
+    
     total_students_loaded = k12_summary.get('k12_total', float('nan'))
     total_block_groups_loaded = k12_summary.get('block_groups', len(demographics))
     imputed_count = k12_summary.get('imputed_count', 0)
     component_gaps = k12_summary.get('component_gaps', 0)
     legacy_total = k12_summary.get('legacy_k12_total')
+    bg_cache_ts = k12_summary.get('bg_cache_timestamp', 'N/A')
+    tract_cache_ts = k12_summary.get('tract_cache_timestamp', 'N/A')
 
     st.sidebar.success(
-        f"ACS B14007 enrollment: {total_students_loaded:,.0f} students across {total_block_groups_loaded} block groups"
+        f"ACS 2023 modeled K-12: {total_students_loaded:,.0f} students across {total_block_groups_loaded} block groups"
     )
     st.sidebar.caption(
-        f"Imputed block groups: {imputed_count}; component gaps flagged: {component_gaps}."
+        f"Imputed block groups: {imputed_count}."
     )
+    st.sidebar.caption(f"Cache: BG={bg_cache_ts[:10]} | Tract={tract_cache_ts[:10]}")
     if imputed_count:
-        st.sidebar.warning("Imputed 0 students where ACS enrollment data was missing; review k12_imputed flag in exports.")
+        st.sidebar.warning("Modeled 0 students where ACS data was missing; check k12_imputed flag in exports.")
     if legacy_total and not np.isnan(legacy_total):
         st.sidebar.caption(f"Legacy CSV K-12 total (pre-ACS refresh): {legacy_total:,.0f}")
 
@@ -815,19 +1042,41 @@ def main():
     # Add helpful info about the data
     with st.expander("ℹ️ About This Data", expanded=False):
         st.write(f"""
-        **Geography:** {len(demographics):,} Philadelphia Census block groups (ACS 2022 five-year estimates).
+        **Geography:** {len(demographics):,} Philadelphia Census block groups (ACS 2023 five-year estimates).
+
+        **K-12 Demand Methodology (ACS 2023):**
+        - **Block-group population age 5–17:** B01001_004E, B01001_005E, B01001_006E, B01001_028E, B01001_029E, B01001_030E (summed)
+        - **Tract-level K-12 enrollment:** S1401_C01_004E (kindergarten), S1401_C01_005E (grades 1-8), S1401_C01_006E (grades 9-12) (summed)
+        - **Downscaling formula:** bg_enrolled_k12 = tract_rate_k12 × bg_age_5_17, where tract_rate_k12 = tract_enrolled_k12 / tract_population_age_5-17
+        - **Result flag:** All block groups marked is_modeled=True; imputed block groups (missing ACS data) marked separately.
 
         **Enrollment Signals:**
-        - Total K-12 students: {demographics['k12_pop'].sum():,.0f}
+        - Total K-12 students: {demographics['k12_pop'].sum():,.0f} (modeled via ACS 2023)
         - Blocks with school-age children: {(demographics['k12_pop'] > 0).sum():,}
         - Blocks flagged as non-residential (0 population): {(demographics['total_pop'] == 0).sum():,}
 
-        **Sources & Refresh:**
-        - Student demand, household income, poverty, and first-generation metrics originate from Census ACS tables.
-        - School supply layers pair CCA campuses with NCES public/private school directories.
-        - Use the **Live Census Data** control to pull fresh ACS figures when the API key is available.
+        **EDI Calculation & Toggle:**
+        - **Default behavior:** EDI uses only CCA and public school seats from NCES.
+        - **With competitors toggled:** EDI adds charter and private school capacity to the supply-side calculation.
+        - **Distance-based fallback:** If no school supply data available, a simple distance-to-nearest-campus model is used.
 
-        Tip: apply the optional filters to remove industrial corridors and highlight neighborhoods where CCA families live today.
+        **HPFI & Overlay Mode:**
+        - HPFI (High-Potential Family Index) combines income, first-generation %, and K-12 demand using 0–1 normalized weights.
+        - Overlay: EDI × HPFI uses 75th-percentile thresholds to segment into 4 zones: Golden (high/high), Mission (high/low), Affluent Opportunity (low/high), Low Priority (low/low).
+        - HPFI and EDI remain independent; overlay mode merges both signals for strategic targeting.
+
+        **Sources & Refresh:**
+        - Student demand: ACS B01001 (age) + S1401 (school enrollment).
+        - Household income, poverty, and first-generation metrics: ACS tables.
+        - School supply: CCA campuses + NCES public/private school directories.
+        - Use the **Live Census Data** control to pull fresh ACS figures when the API key is available.
+        - Cache files stored in data/cache/ with timestamps.
+
+        **Competitor School Toggle:**
+        - Competitor checkbox controls visibility only (always shown on map if enabled).
+        - Competitor seats are included in EDI calculation only if "Include Competitor Schools in EDI Calculation" is toggled.
+
+        Tip: Apply optional filters to remove industrial corridors and highlight neighborhoods where CCA families live today.
         """)
     
     # Sidebar filters
@@ -1041,11 +1290,23 @@ def main():
         'First-Generation %': 'first_gen_pct'
     }
     
-    selected_metric = st.sidebar.selectbox(
-        "Color Map By:", 
-        list(color_options.keys()),
-        index=0
+    map_mode_options = ['EDI', 'HPFI', 'Overlay: EDI × HPFI']
+    selected_map_mode = st.sidebar.selectbox(
+        "Map Mode:",
+        map_mode_options,
+        index=0,
+        help="Select visualization mode: single metric or 4-zone overlay"
     )
+    
+    # If overlay mode, use zone colors; otherwise use the classic selection
+    if selected_map_mode == 'Overlay: EDI × HPFI':
+        selected_metric = 'Overlay: EDI × HPFI'
+    else:
+        selected_metric = st.sidebar.selectbox(
+            "Color Map By:", 
+            list(color_options.keys()),
+            index=0
+        )
     
     # Calculate EDI if needed
     if not demographics_filtered.empty:
@@ -1100,6 +1361,11 @@ def main():
         demographics_filtered['first_gen_pct'] = pd.to_numeric(demographics_filtered.get('first_gen_pct'), errors='coerce')
 
     demographics_filtered = compute_hpfi_scores(demographics_filtered, edi_col="EDI" if 'EDI' in demographics_filtered.columns else 'edi')
+
+    # Compute zones if overlay mode is selected
+    if selected_map_mode == 'Overlay: EDI × HPFI':
+        demographics_filtered = compute_edi_hpfi_zones(demographics_filtered, edi_col="EDI", hpfi_col="hpfi")
+    
 
     hpfi_threshold = None
     if highlight_hpfi and not demographics_filtered.empty:
@@ -1188,21 +1454,44 @@ def main():
         # Main map
         st.subheader(f"📍 {selected_metric} by Block Group")
         
-        if color_options[selected_metric] in demographics_filtered.columns:
+        # Check if we're in overlay mode
+        is_overlay_mode = selected_metric == 'Overlay: EDI × HPFI'
+        
+        if is_overlay_mode or (selected_metric in color_options and color_options[selected_metric] in demographics_filtered.columns):
             if hpfi_threshold is not None:
                 st.info(f"HPFI highlight enabled: showing block groups with HPFI ≥ {hpfi_threshold:.2f}.")
+            
+            # Show zone counts for overlay mode
+            if is_overlay_mode and 'zone' in demographics_filtered.columns:
+                zone_counts = demographics_filtered['zone'].value_counts()
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    golden_count = zone_counts.get('Golden Zone', 0)
+                    st.metric('Golden Zone', golden_count, help='High EDI & High HPFI')
+                with col2:
+                    mission_count = zone_counts.get('Mission Zone', 0)
+                    st.metric('Mission Zone', mission_count, help='High EDI & Low HPFI')
+                with col3:
+                    affluent_count = zone_counts.get('Affluent Opportunity Zone', 0)
+                    st.metric('Affluent Opportunity', affluent_count, help='Low EDI & High HPFI')
+                with col4:
+                    low_priority_count = zone_counts.get('Low Priority Zone', 0)
+                    st.metric('Low Priority Zone', low_priority_count, help='Low EDI & Low HPFI')
+            
             visible_competition = competition_schools[
                 competition_schools['type'].isin(selected_competition_types)
             ] if selected_competition_types else pd.DataFrame()
+            
             fig = create_choropleth_map(
                 gdf_filtered, 
                 demographics_filtered, 
-                color_options[selected_metric],
+                color_options.get(selected_metric, 'k12_pop') if not is_overlay_mode else 'zone',
                 f"{selected_metric} across Philadelphia Block Groups",
                 show_current_students,
                 current_students if show_current_students else None,
                 show_competition_overlay,
-                visible_competition
+                visible_competition,
+                use_zones=is_overlay_mode
             )
             st.plotly_chart(fig, width='stretch')
         else:
@@ -1210,6 +1499,23 @@ def main():
         
         # Analysis tables
         st.subheader("📊 Detailed Analysis")
+        
+        # Overlay mode: show zone breakdown first
+        if is_overlay_mode and 'zone' in demographics_filtered.columns:
+            st.write("**Top Golden Zones (EDI × HPFI Overlay)**")
+            golden_zones = demographics_filtered[demographics_filtered['zone'] == 'Golden Zone'].nlargest(10, 'EDI')[
+                ['block_group_id', 'EDI', 'hpfi', 'income', 'first_gen_pct', 'k12_pop']
+            ].copy()
+            if len(golden_zones) > 0:
+                golden_zones['EDI'] = golden_zones['EDI'].map(lambda v: f"{v:.2f}")
+                golden_zones['hpfi'] = golden_zones['hpfi'].map(lambda v: f"{v:.2f}")
+                golden_zones['income'] = golden_zones['income'].map(lambda v: f"${v:,.0f}")
+                golden_zones['first_gen_pct'] = golden_zones['first_gen_pct'].map(lambda v: f"{v:.1f}%")
+                golden_zones['k12_pop'] = golden_zones['k12_pop'].map(lambda v: f"{int(v):,}")
+                st.dataframe(golden_zones, width='stretch', use_container_width=True)
+            else:
+                st.info("No block groups found in Golden Zone.")
+            st.divider()
         
         col1, col2, col3 = st.columns(3)
         
