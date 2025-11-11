@@ -589,9 +589,9 @@ def load_block_group_data():
 
 @st.cache_data  
 def load_current_students():
-    """Load current student overlay data."""
+    """Load current student overlay data (anonymized locations)."""
     try:
-        return pd.read_csv('current_students.csv')
+        return pd.read_csv('current_students_anonymized.csv')
     except Exception as e:
         st.error(f"Error loading student overlay data: {e}")
         return pd.DataFrame()
