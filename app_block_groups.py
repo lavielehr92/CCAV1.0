@@ -901,10 +901,9 @@ def create_choropleth_map(
             'Other': '#2CA02C'
         }
         comp_copy = competition_df.copy()
-        comp_copy['type'] = comp_copy['type'].fillna('Other')
-        # Map colors based on school type
-        color_list = [palette.get(t, '#2CA02C') for t in comp_copy['type']]
-        comp_copy['color'] = color_list
+        comp_copy['type'] = comp_copy['type'].fillna('Other').astype(str)
+        # Map colors based on school type - ensure we get a proper list
+        comp_copy['color'] = comp_copy['type'].apply(lambda t: palette.get(t, '#2CA02C'))
         comp_copy['capacity'] = pd.to_numeric(comp_copy.get('capacity'), errors='coerce')
 
         def grade_band(label: object) -> str:
@@ -948,13 +947,13 @@ def create_choropleth_map(
         custom_comp = comp_copy[hover_cols].fillna('').to_numpy()
 
         fig.add_scattermapbox(
-            lat=comp_copy['lat'],
-            lon=comp_copy['lon'],
+            lat=comp_copy['lat'].tolist(),
+            lon=comp_copy['lon'].tolist(),
             mode='markers',
             marker=dict(
                 size=14,
                 symbol='diamond',
-                color=comp_copy['color'],
+                color=comp_copy['color'].tolist(),
                 opacity=0.95,
                 line=dict(width=2, color='white')
             ),
