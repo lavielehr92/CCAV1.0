@@ -1255,11 +1255,20 @@ def create_choropleth_map(
     if highlight_premium and 'marketing_zone' in plot_data.columns:
         premium = plot_data[plot_data['marketing_zone'] == 'Premium Growth Target']
         if not premium.empty and 'lat' in premium.columns and 'lon' in premium.columns:
+            # Draw a subtle white outline marker first, then the colored marker inside to emulate an outline
             fig.add_scattermapbox(
                 lat=premium['lat'],
                 lon=premium['lon'],
                 mode='markers',
-                marker=dict(size=18, color='magenta', opacity=0.3, line=dict(width=2, color='white')),
+                marker=dict(size=22, color='white', opacity=0.7, symbol='circle'),
+                showlegend=False,
+                hoverinfo='skip'
+            )
+            fig.add_scattermapbox(
+                lat=premium['lat'],
+                lon=premium['lon'],
+                mode='markers',
+                marker=dict(size=18, color='magenta', opacity=0.9, symbol='circle'),
                 name='Premium Growth Targets',
                 hoverinfo='skip'
             )
