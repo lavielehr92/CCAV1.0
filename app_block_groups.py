@@ -8,6 +8,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import geopandas as gpd
 import json
+from typing import Dict
 import os
 from pathlib import Path
 import requests
@@ -79,6 +80,39 @@ TRACT_ENROLLMENT_FIELDS = {
 
 DATA_CACHE_DIR = Path("data/cache")
 DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Paths for optional external layers (CSV files stored locally)
+EXTERNAL_DATA_DIR = Path("data/external")
+EXTERNAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+LAYER_PATHS = {
+    'vacancy': EXTERNAL_DATA_DIR / 'vacancy_block_groups.csv',
+    'crime': EXTERNAL_DATA_DIR / 'crime_per_block_group.csv',
+    'food': EXTERNAL_DATA_DIR / 'food_access_block_groups.csv',
+    'transit': EXTERNAL_DATA_DIR / 'transit_access_block_groups.csv',
+    'gini': EXTERNAL_DATA_DIR / 'gini_block_groups.csv',
+    'hud': EXTERNAL_DATA_DIR / 'hud_assisted_block_groups.csv',
+}
+
+# Default weight profile for interactive sliders
+WEIGHT_DEFAULTS: Dict[str, float] = {
+    'hpfi_income': 0.45,
+    'hpfi_inverse_poverty': 0.18,
+    'hpfi_proximity': 0.13,
+    'hpfi_christian': 0.12,
+    'hpfi_k12': 0.09,
+    'hpfi_inverse_edi': 0.03,
+    'edi_access': 0.40,
+    'edi_ratio': 0.30,
+    'edi_need': 0.20,
+    'edi_infra': 0.10,
+    'rhi_premium': 0.35,
+    'rhi_transit': 0.15,
+    'rhi_crime': 0.15,
+    'rhi_vacancy': 0.10,
+    'rhi_gini': 0.10,
+    'rhi_student_proximity': 0.10,
+    'rhi_faith': 0.05,
+}
 
 # Helper function to get Census API key from multiple sources
 def get_census_api_key():
@@ -272,6 +306,103 @@ def validate_k12_total(demographics: pd.DataFrame, tract_enrollment_data: pd.Dat
     return result
 
 
+@st.cache_data(ttl=86400)
+def load_external_layer(name: str) -> pd.DataFrame:
+    """Load optional external layer CSV into a DataFrame (if available).
+
+    Expected column: block_group_id plus a numeric metric column per layer (e.g., vacant_pct, crimes_per_1k, transit_score, food_access_score, gini_index).
+    """
+    path = LAYER_PATHS.get(name)
+    if path is None or not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+        df['block_group_id'] = df['block_group_id'].astype(str)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def normalise_series(series: pd.Series) -> pd.Series:
+    """Normalize numeric series to [0,1] using min-max scaling; handle constant series by returning 0.5."""
+    ser = pd.to_numeric(series, errors='coerce')
+    if ser.dropna().empty:
+        return pd.Series(0.0, index=ser.index)
+    minv, maxv = ser.min(), ser.max()
+    if pd.isna(minv) or pd.isna(maxv) or minv == maxv:
+        # No spread - use median-level
+        return pd.Series(0.5, index=ser.index)
+    return ((ser - minv) / (maxv - minv)).clip(0, 1).fillna(0.0)
+
+
+def merge_optional_layers(demos: pd.DataFrame) -> pd.DataFrame:
+    """Merge available external layers into demographics and compute normalized scores.
+
+    Known new columns:
+    - vacancy_norm (higher => more vacant properties)
+    - crime_norm (higher => safer = 1 - crime per 1k normalized)
+    - transit_norm (higher => better transit access)
+    - food_access_norm (higher => better access to food resources)
+    - gini_norm (higher => more inequality)
+    - hud_presence (1 if HUD-assisted housing present else 0)
+    """
+    df = demos.copy()
+    # Vacancy
+    vac = load_external_layer('vacancy')
+    if not vac.empty:
+        df = df.merge(vac[['block_group_id', 'vacant_pct']], on='block_group_id', how='left')
+    else:
+        df['vacant_pct'] = df.get('vacant_pct', 0)
+    df['vacancy_norm'] = normalise_series(df['vacant_pct'])
+    # Crime
+    crime = load_external_layer('crime')
+    if not crime.empty:
+        df = df.merge(crime[['block_group_id', 'crimes_per_1k']], on='block_group_id', how='left')
+    else:
+        df['crimes_per_1k'] = df.get('crimes_per_1k', 0)
+    # Higher `crimes_per_1k` -> worse; we invert it to safety score
+    df['crime_norm'] = 1.0 - normalise_series(df['crimes_per_1k'])
+    # Transit
+    transit = load_external_layer('transit')
+    if not transit.empty:
+        df = df.merge(transit[['block_group_id', 'transit_access_score']], on='block_group_id', how='left')
+    else:
+        df['transit_access_score'] = df.get('transit_access_score', 0)
+    df['transit_norm'] = normalise_series(df['transit_access_score'])
+    # Food access
+    food = load_external_layer('food')
+    if not food.empty:
+        df = df.merge(food[['block_group_id', 'food_access_score']], on='block_group_id', how='left')
+    else:
+        df['food_access_score'] = df.get('food_access_score', 0)
+    df['food_access_norm'] = normalise_series(df['food_access_score'])
+    # Gini index
+    gini = load_external_layer('gini')
+    if not gini.empty:
+        df = df.merge(gini[['block_group_id', 'gini_index']], on='block_group_id', how='left')
+    else:
+        df['gini_index'] = df.get('gini_index', 0)
+    df['gini_norm'] = normalise_series(df['gini_index'])
+    # HUD presence
+    hud = load_external_layer('hud')
+    if not hud.empty:
+        df = df.merge(hud[['block_group_id', 'hud_assisted']], on='block_group_id', how='left')
+        df['hud_assisted'] = df['hud_assisted'].fillna(0)
+    else:
+        df['hud_assisted'] = 0
+    df['hud_presence'] = df['hud_assisted'].fillna(0).astype(int)
+
+    # Faith / Christian normalization
+    if '%Christian' in df.columns:
+        df['faith_norm'] = normalise_series(df['%Christian'])
+    elif 'pct_christian' in df.columns:
+        df['faith_norm'] = normalise_series(df['pct_christian'])
+    else:
+        df['faith_norm'] = 0.0
+
+    return df
+
+
 def compute_edi_hpfi_zones(demographics: pd.DataFrame, edi_col: str = "EDI", hpfi_col: str = "hpfi") -> pd.DataFrame:
     """
     Create 4-zone overlay using 75th percentile thresholds for EDI and HPFI.
@@ -460,7 +591,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-def compute_hpfi_scores(df: pd.DataFrame, edi_col: str = "EDI") -> pd.DataFrame:
+def compute_hpfi_scores(df: pd.DataFrame, edi_col: str = "EDI", weights: Dict[str, float] | None = None) -> pd.DataFrame:
     """Attach High-Potential Family Index (0-1) to the provided DataFrame.
     
     Tuned to prioritize tuition-paying potential through higher income weighting,
@@ -537,23 +668,24 @@ def compute_hpfi_scores(df: pd.DataFrame, edi_col: str = "EDI") -> pd.DataFrame:
     # Normalize to 0-1 scale (36.3% min, 47.5% max based on church density)
     christian_norm = normalise(christian_series)
 
-    # Updated weights including mission alignment
-    weights = {
-        "income": 0.45,           # Primary tuition signal (down from 50%)
-        "inverse_poverty": 0.18,  # Economic stability (down from 20%)
-        "proximity": 0.13,        # Distance to CCA campuses (down from 15%)
-        "christian": 0.12,        # NEW - Mission alignment (faith community strength)
-        "k12": 0.09,              # Market size (down from 10%)
-        "inverse_edi": 0.03,      # Low competition (down from 5%)
-    }
+    # Allow dynamic weights from session state or fallback to defaults
+    if weights is None:
+        weights = {
+            "income": 0.45,           # Primary tuition signal
+            "inverse_poverty": 0.18,  # Economic stability
+            "proximity": 0.13,        # Distance to CCA campuses
+            "christian": 0.12,        # Mission alignment
+            "k12": 0.09,              # Market size
+            "inverse_edi": 0.03,      # Low competition signal
+        }
 
     hpfi = (
-        weights["income"] * income_norm +
-        weights["inverse_poverty"] * inverse_poverty_norm +
-        weights["proximity"] * proximity_norm +
-        weights["christian"] * christian_norm +
-        weights["k12"] * k12_norm +
-        weights["inverse_edi"] * inverse_edi
+        weights.get('income', 0.45) * income_norm +
+        weights.get('inverse_poverty', 0.18) * inverse_poverty_norm +
+        weights.get('proximity', 0.13) * proximity_norm +
+        weights.get('christian', 0.12) * christian_norm +
+        weights.get('k12', 0.09) * k12_norm +
+        weights.get('inverse_edi', 0.03) * inverse_edi
     )
 
     working["hpfi"] = hpfi.clip(0.0, 1.0)
@@ -632,6 +764,13 @@ def load_block_group_data():
         f"Imputed block groups: {demos_summary['imputed_count']}."
     )
 
+    # Merge optional external layers (vacancy, crime, transit, food, gini, HUD)
+    try:
+        demographics = merge_optional_layers(demographics)
+    except Exception:
+        # If optional layers are missing or fail, keep going with core dataset
+        demographics = demographics
+
     demographics = ensure_block_group_id(demographics)
     return gdf, demographics, demos_summary
 
@@ -653,7 +792,16 @@ def create_choropleth_map(
     students_df=None,
     show_competition=False,
     competition_df=None,
-    use_zones=False
+    use_zones=False,
+    map_style: str = 'open-street-map',
+    show_student_heatmap: bool = False,
+    student_heatmap_radius: int = 15,
+    highlight_premium: bool = False,
+    show_vacancy_layer: bool = False,
+    show_crime_layer: bool = False,
+    show_transit_layer: bool = False,
+    show_food_layer: bool = False,
+    show_hud_layer: bool = False,
 ):
     """Create choropleth map with block group boundaries.
     
@@ -733,7 +881,8 @@ def create_choropleth_map(
     hover_template += 'EDI: %{customdata[1]}<br>'
     hover_template += 'Median Income: %{customdata[2]}<br>'
     hover_template += 'K-12 Population: %{customdata[3]}<br>'
-    hover_template += 'HPFI: %{customdata[4]}<extra></extra>'
+    hover_template += 'HPFI: %{customdata[4]}<br>'
+    hover_template += 'RHI: %{customdata[5]}<extra></extra>'
     
     # Prepare custom data for hover with proper formatting
     cleaned = plot_data.copy()
@@ -820,6 +969,7 @@ def create_choropleth_map(
             format_value(row, 'income', 'currency'),
             format_value(row, 'k12_pop', 'integer'),
             format_value(row, 'hpfi', 'hpfi'),
+            format_value(row, 'recruitment_heat_index', 'number') if 'recruitment_heat_index' in row.index else 'N/A',
             zone_val,
         ])
 
@@ -868,6 +1018,69 @@ def create_choropleth_map(
         showscale=True
     )
 
+    # Optional overlays for new layers - use lower opacity choropleth for contextual layers
+    if show_vacancy_layer and 'vacancy_norm' in cleaned.columns:
+        fig.add_choroplethmapbox(
+            geojson=geojson_data,
+            locations=plot_data.index,
+            z=cleaned['vacancy_norm'].fillna(0).astype(float).values,
+            featureidkey='id',
+            colorscale='YlOrRd',
+            marker_opacity=0.35,
+            marker_line_width=0,
+            showscale=False,
+            name='Vacancy'
+        )
+    if show_crime_layer and 'crime_norm' in cleaned.columns:
+        fig.add_choroplethmapbox(
+            geojson=geojson_data,
+            locations=plot_data.index,
+            z=1.0 - cleaned['crime_norm'].fillna(0).astype(float).values,  # crime intensity
+            featureidkey='id',
+            colorscale='Reds',
+            marker_opacity=0.35,
+            marker_line_width=0,
+            showscale=False,
+            name='Crime Intensity'
+        )
+    if show_transit_layer and 'transit_norm' in cleaned.columns:
+        fig.add_choroplethmapbox(
+            geojson=geojson_data,
+            locations=plot_data.index,
+            z=cleaned['transit_norm'].fillna(0).astype(float).values,
+            featureidkey='id',
+            colorscale='Blues',
+            marker_opacity=0.35,
+            marker_line_width=0,
+            showscale=False,
+            name='Transit Access'
+        )
+    if show_food_layer and 'food_access_norm' in cleaned.columns:
+        fig.add_choroplethmapbox(
+            geojson=geojson_data,
+            locations=plot_data.index,
+            z=cleaned['food_access_norm'].fillna(0).astype(float).values,
+            featureidkey='id',
+            colorscale='Greens',
+            marker_opacity=0.35,
+            marker_line_width=0,
+            showscale=False,
+            name='Food Access'
+        )
+    if show_hud_layer and 'hud_presence' in cleaned.columns:
+        # Show HUD-assisted areas as a semi-transparent layer
+        fig.add_choroplethmapbox(
+            geojson=geojson_data,
+            locations=plot_data.index,
+            z=cleaned['hud_presence'].fillna(0).astype(float).values,
+            featureidkey='id',
+            colorscale=[[0, 'rgba(0,0,0,0)'], [1, '#000000']],
+            marker_opacity=0.25,
+            marker_line_width=0,
+            showscale=False,
+            name='HUD Assisted Areas'
+        )
+
     # Compute bounds and center for auto-fit
     try:
         # Ensure CRS is WGS84
@@ -901,7 +1114,7 @@ def create_choropleth_map(
 
     # Update layout for map with auto-fit to locations
     fig.update_layout(
-        mapbox_style="open-street-map",
+        mapbox_style=map_style,
         mapbox_center={"lat": center_lat, "lon": center_lon},
         mapbox_zoom=zoom,
         title=title,
@@ -935,12 +1148,25 @@ def create_choropleth_map(
             lat=students_df['lat'],
             lon=students_df['lon'],
             mode='markers',
-            marker=dict(size=6, color='blue', opacity=0.6),
+            marker=dict(size=8, color='blue', opacity=0.9, symbol='circle'),
             name='Current Students',
             hovertemplate='<b>👨‍🎓 Current CCA Student</b><br>' +
                          'Lat: %{lat:.4f}<br>' +
                          'Lon: %{lon:.4f}<extra></extra>'
         )
+        # Optional student density heatmap layer
+        if show_student_heatmap:
+            try:
+                fig.add_densitymapbox(
+                    lat=students_df['lat'],
+                    lon=students_df['lon'],
+                    radius=student_heatmap_radius,
+                    colorscale="Blues",
+                    opacity=0.45,
+                    name='Student Density'
+                )
+            except Exception:
+                pass
 
     if show_competition and competition_df is not None and not competition_df.empty:
         palette = {
@@ -1025,6 +1251,18 @@ def create_choropleth_map(
                 ),
                 name='Competitor Schools'
             )
+    # Highlight Premium Growth Target block groups as overlay
+    if highlight_premium and 'marketing_zone' in plot_data.columns:
+        premium = plot_data[plot_data['marketing_zone'] == 'Premium Growth Target']
+        if not premium.empty and 'lat' in premium.columns and 'lon' in premium.columns:
+            fig.add_scattermapbox(
+                lat=premium['lat'],
+                lon=premium['lon'],
+                mode='markers',
+                marker=dict(size=18, color='magenta', opacity=0.3, line=dict(width=2, color='white')),
+                name='Premium Growth Targets',
+                hoverinfo='skip'
+            )
     
     return fig
 
@@ -1083,6 +1321,57 @@ def calculate_marketing_priority_bg(demographics_df, cca_campuses):
         marketing_scores.append(score)
 
     return marketing_scores
+
+
+def compute_student_proximity_norm(demos: pd.DataFrame, students_df: pd.DataFrame, radius_km: float = 5.0) -> pd.Series:
+    """Compute normalized proximity score based on counts of students within radius_km of block-group centroid.
+
+    Returns series with values 0-1 (higher = more nearby students).
+    """
+    if students_df is None or students_df.empty:
+        return pd.Series(0.0, index=demos.index)
+    students = students_df.copy()
+    students['lat'] = pd.to_numeric(students.get('lat'), errors='coerce')
+    students['lon'] = pd.to_numeric(students.get('lon'), errors='coerce')
+    students = students.dropna(subset=['lat', 'lon'])
+    counts = []
+    for _, row in demos.iterrows():
+        if pd.isna(row.get('lat')) or pd.isna(row.get('lon')):
+            counts.append(0)
+            continue
+        dists = [haversine_km(row['lat'], row['lon'], lat, lon) for lat, lon in zip(students['lat'], students['lon'])]
+        counts.append(sum(1 for d in dists if d <= radius_km))
+    return normalise_series(pd.Series(counts, index=demos.index))
+
+
+def compute_recruitment_heat_index(demos: pd.DataFrame, weights: Dict[str, float], students_df: pd.DataFrame = None) -> pd.Series:
+    """Compute Recruitment Heat Index (0-100) per block group.
+    Uses normalized component scores and a weighting profile.
+    """
+    df = demos.copy()
+    # Ensure normalized fields exist
+    df['premium_flag'] = (df.get('marketing_zone') == 'Premium Growth Target').astype(float)
+    df['transit_norm'] = df.get('transit_norm', 0.0).fillna(0.0)
+    df['crime_norm'] = df.get('crime_norm', 0.0).fillna(0.0)
+    df['vacancy_norm'] = df.get('vacancy_norm', 0.0).fillna(0.0)
+    df['gini_norm'] = df.get('gini_norm', 0.0).fillna(0.0)
+    df['faith_norm'] = df.get('faith_norm', 0.0).fillna(0.0)
+    # student proximity normalized score
+    df['student_proximity_norm'] = compute_student_proximity_norm(df, students_df)
+
+    rhi_numer = (
+        weights.get('rhi_premium', 0) * df['premium_flag'] +
+        weights.get('rhi_transit', 0) * df['transit_norm'] +
+        weights.get('rhi_crime', 0) * df['crime_norm'] +
+        weights.get('rhi_vacancy', 0) * df['vacancy_norm'] +
+        weights.get('rhi_gini', 0) * df['gini_norm'] +
+        weights.get('rhi_student_proximity', 0) * df['student_proximity_norm'] +
+        weights.get('rhi_faith', 0) * df['faith_norm']
+    )
+    denom = sum(weights.get(k, 0) for k in weights if k.startswith('rhi_'))
+    denom = denom if denom > 0 else 1.0
+    rhi_score = (rhi_numer / denom).clip(0, 1)
+    return (rhi_score * 100).round(2)
 
 # Main app
 def main():
@@ -1278,6 +1567,9 @@ def main():
             key="distance_slider"
         )
         st.caption(f"✓ Showing areas within {max_distance}km of campuses")
+        # New quick controls for Premium Growth Targets
+        show_premium_only = st.checkbox("Show Premium Growth Targets Only", value=False, help="Filter map to Premium Growth Targets (HPFI & moderate EDI)")
+        premium_top_n = st.selectbox("Top N Premium Targets", options=["All", 50, 100], index=0)
     
     # CCA Campus locations
     cca_campuses = pd.DataFrame({
@@ -1395,6 +1687,16 @@ def main():
                     ]
                 else:
                     st.warning("No valid economic data available")
+            # Decay options for EDI calculation (advanced)
+            st.subheader("EDI Decay Settings (Advanced)")
+            decay_type = st.selectbox(
+                "Decay Function",
+                options=['exponential', 'gaussian', 'linear', 'fixed'],
+                index=0,
+                help="Choose the gravity decay function used in the EDI 2SFCA algorithm"
+            )
+            decay_param = st.slider("Decay Parameter (km)", min_value=1.0, max_value=25.0, value=5.0, step=0.5, help="Beta or radius parameter for the selected decay function")
+            catchment_km = st.slider("Catchment Radius (km)", min_value=5, max_value=50, value=15, step=1, help="Max distance to consider schools for EDI calculations")
         
     else:
         st.info("📍 No block groups found within the specified radius. Try expanding your geographic scope.")
@@ -1407,6 +1709,12 @@ def main():
             value=False,
             help="Overlay current CCA student addresses"
         )
+        highlight_premium = st.checkbox("Highlight Premium Growth Targets", value=True, help="Overlay a visual highlight on Premium Growth Target block groups", key='highlight_premium')
+        show_vacancy_layer = st.checkbox('Show Vacancy Layer', value=False, key='show_vacancy_layer')
+        show_crime_layer = st.checkbox('Show Crime Layer', value=False, key='show_crime_layer')
+        show_transit_layer = st.checkbox('Show Transit Layer', value=False, key='show_transit_layer')
+        show_food_layer = st.checkbox('Show Food Access Layer', value=False, key='show_food_layer')
+        show_hud_layer = st.checkbox('Show HUD Zones Layer', value=False, key='show_hud_layer')
         show_competition_overlay = st.checkbox(
             "Show Other Educational Options", 
             value=True,
@@ -1458,6 +1766,43 @@ def main():
         📧 Questions? Contact your data team.
         """)
 
+    # Scoring Weights control - keep compact and resettable
+    with st.sidebar.expander("⚖️ Scoring Weights", expanded=False):
+        st.write("Tune internal scoring weights for HPFI / EDI / Recruitment Heat Index. Use 'Restore Defaults' to reset.")
+        col_hpfi, col_edi, col_rhi = st.columns(3)
+        # Ensure session state defaults
+        if 'hpfi_weights' not in st.session_state:
+            st.session_state['hpfi_weights'] = {k: v for k, v in WEIGHT_DEFAULTS.items() if k.startswith('hpfi')}
+        if 'edi_weights' not in st.session_state:
+            st.session_state['edi_weights'] = {k: v for k, v in WEIGHT_DEFAULTS.items() if k.startswith('edi')}
+        if 'rhi_weights' not in st.session_state:
+            st.session_state['rhi_weights'] = {k: v for k, v in WEIGHT_DEFAULTS.items() if k.startswith('rhi')}
+        with col_hpfi:
+            st.markdown("**HPFI**")
+            for key in list(st.session_state['hpfi_weights'].keys()):
+                label = key.replace('hpfi_', '').replace('_', ' ').title()
+                st.session_state['hpfi_weights'][key] = st.slider(label, 0.0, 1.0, float(st.session_state['hpfi_weights'][key]), 0.01)
+        with col_edi:
+            st.markdown("**EDI**")
+            for key in list(st.session_state['edi_weights'].keys()):
+                label = key.replace('edi_', '').replace('_', ' ').title()
+                st.session_state['edi_weights'][key] = st.slider(label, 0.0, 1.0, float(st.session_state['edi_weights'][key]), 0.01)
+        with col_rhi:
+            st.markdown("**RHI**")
+            for key in list(st.session_state['rhi_weights'].keys()):
+                label = key.replace('rhi_', '').replace('_', ' ').title()
+                st.session_state['rhi_weights'][key] = st.slider(label, 0.0, 1.0, float(st.session_state['rhi_weights'][key]), 0.01)
+        if st.button('Restore Default Weights'):
+            st.session_state['hpfi_weights'] = {k: v for k, v in WEIGHT_DEFAULTS.items() if k.startswith('hpfi')}
+            st.session_state['edi_weights'] = {k: v for k, v in WEIGHT_DEFAULTS.items() if k.startswith('edi')}
+            st.session_state['rhi_weights'] = {k: v for k, v in WEIGHT_DEFAULTS.items() if k.startswith('rhi')}
+
+    # Map style and optional student heatmap controls
+    with st.sidebar.expander("🗺️ Map Style & Display", expanded=False):
+        st.selectbox('Base Map Style', ['open-street-map', 'carto-positron', 'satellite-streets'], index=0, key='map_style')
+        st.checkbox('Show Student Heatmap (Kernel)', value=False, key='show_student_heatmap')
+        st.slider('Student Heatmap Radius (px)', 5, 50, 15, key='student_heatmap_radius')
+
     supply_columns = ['lat', 'lon', 'capacity']
 
     def prepare_supply_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -1492,7 +1837,16 @@ def main():
         with st.spinner("Calculating Educational Desert Index across all block groups..."):
             demographics_for_edi = demographics[demographics['total_pop'] > 0].copy()
             if not demographics_for_edi.empty:
-                edi_full_df = compute_edi_block_groups(demographics_for_edi, edi_supply_df)
+                edi_full_df = compute_edi_block_groups(
+                    demographics_for_edi, edi_supply_df,
+                    catchment_km=catchment_km, beta_km=decay_param, decay_type=decay_type, decay_param=decay_param,
+                    comp_weights=(
+                        st.session_state.get('edi_weights', {}).get('edi_access', 0.40),
+                        st.session_state.get('edi_weights', {}).get('edi_ratio', 0.30),
+                        st.session_state.get('edi_weights', {}).get('edi_need', 0.20),
+                        st.session_state.get('edi_weights', {}).get('edi_infra', 0.10),
+                    )
+                )
                 demographics = demographics.drop(columns=['EDI'], errors='ignore')
                 demographics = demographics.merge(
                     edi_full_df[['block_group_id', 'EDI']],
@@ -1507,7 +1861,7 @@ def main():
         demographics['EDI'] = 0.0
 
     demographics = demographics.drop(columns=['hpfi', 'nearest_campus_km'], errors='ignore')
-    demographics = compute_hpfi_scores(demographics, edi_col="EDI")
+    demographics = compute_hpfi_scores(demographics, edi_col="EDI", weights=st.session_state.get('hpfi_weights'))
     hpfi_global_75 = float(demographics['hpfi'].quantile(0.75)) if not demographics['hpfi'].empty else 0.75
 
     edi_zone_df = compute_edi_hpfi_zones(demographics, edi_col="EDI", hpfi_col="hpfi")
@@ -1529,6 +1883,13 @@ def main():
 
     demographics['marketing_priority'] = calculate_marketing_priority_bg(demographics, cca_campuses)
 
+    # Compute Recruitment Heat Index (RHI)
+    try:
+        rhi_weights = st.session_state.get('rhi_weights', {k: v for k, v in WEIGHT_DEFAULTS.items() if k.startswith('rhi')})
+        demographics['recruitment_heat_index'] = compute_recruitment_heat_index(demographics, rhi_weights, current_students)
+    except Exception as exc:
+        demographics['recruitment_heat_index'] = 0
+
     metrics_cols = ['block_group_id', 'EDI', 'hpfi', 'nearest_campus_km', 'zone', 'marketing_zone', 'marketing_priority']
     metric_only_cols = [col for col in metrics_cols if col != 'block_group_id']
     demographics_filtered = demographics_filtered.drop(columns=[col for col in metric_only_cols if col in demographics_filtered.columns], errors='ignore')
@@ -1540,11 +1901,17 @@ def main():
         on='block_group_id',
         how='left'
     )
+    # Apply Premium Growth Target quick filter if enabled (use top-N if set)
+    if 'show_premium_only' in locals() and show_premium_only:
+        demographics_filtered = demographics_filtered[demographics_filtered['marketing_zone'] == 'Premium Growth Target'].copy()
+        if premium_top_n in (50, 100):
+            demographics_filtered = demographics_filtered.nlargest(premium_top_n, 'marketing_priority')
     
     # Visualization selection
     color_options = {
         'High-Potential Family Index (HPFI)': 'hpfi',
         'Educational Desert Index (EDI)': 'EDI',
+        'Recruitment Heat Index (RHI)': 'recruitment_heat_index',
         'Median Household Income': 'income',
         'First-Generation %': 'first_gen_pct'
     }
@@ -1596,7 +1963,16 @@ def main():
                     try:
                         demographics_with_pop = demographics_filtered[demographics_filtered['total_pop'] > 0].copy()
                         if not demographics_with_pop.empty:
-                            edi_df = compute_edi_block_groups(demographics_with_pop, edi_supply_df)
+                            edi_df = compute_edi_block_groups(
+                                demographics_with_pop, edi_supply_df,
+                                catchment_km=catchment_km, beta_km=decay_param, decay_type=decay_type, decay_param=decay_param,
+                                comp_weights=(
+                                    st.session_state.get('edi_weights', {}).get('edi_access', 0.40),
+                                    st.session_state.get('edi_weights', {}).get('edi_ratio', 0.30),
+                                    st.session_state.get('edi_weights', {}).get('edi_need', 0.20),
+                                    st.session_state.get('edi_weights', {}).get('edi_infra', 0.10),
+                                )
+                            )
                             demographics_filtered = demographics_filtered.merge(
                                 edi_df[['block_group_id', 'EDI']],
                                 on='block_group_id',
@@ -1616,7 +1992,8 @@ def main():
         if 'hpfi' not in demographics_filtered.columns or demographics_filtered['hpfi'].isna().all():
             demographics_filtered = compute_hpfi_scores(
                 demographics_filtered,
-                edi_col="EDI" if 'EDI' in demographics_filtered.columns else 'edi'
+                edi_col="EDI" if 'EDI' in demographics_filtered.columns else 'edi',
+                weights=st.session_state.get('hpfi_weights')
             )
 
         if 'marketing_priority' not in demographics_filtered.columns:
@@ -1848,15 +2225,39 @@ def main():
                 use_zones_flag = False
             
             fig = create_choropleth_map(
-                gdf_filtered, 
-                demographics_filtered, 
+                gdf_filtered,
+                demographics_filtered,
                 color_col,
                 f"{selected_metric} across Philadelphia Block Groups",
                 show_current_students,
                 current_students if show_current_students else None,
                 show_competition_overlay,
                 visible_competition,
-                use_zones=use_zones_flag
+                use_zones=use_zones_flag,
+                map_style=st.session_state.get('map_style', 'open-street-map'),
+                show_student_heatmap=st.session_state.get('show_student_heatmap', False),
+                student_heatmap_radius=st.session_state.get('student_heatmap_radius', 15),
+                highlight_premium=st.session_state.get('highlight_premium', True),
+                show_vacancy_layer=st.session_state.get('show_vacancy_layer', False),
+                show_crime_layer=st.session_state.get('show_crime_layer', False),
+                show_transit_layer=st.session_state.get('show_transit_layer', False),
+                show_food_layer=st.session_state.get('show_food_layer', False),
+                show_hud_layer=st.session_state.get('show_hud_layer', False)
+            )
+            # Provide map style and optional student heatmap parameters from session state
+            fig = create_choropleth_map(
+                gdf_filtered,
+                demographics_filtered,
+                color_col,
+                f"{selected_metric} across Philadelphia Block Groups",
+                show_current_students,
+                current_students if show_current_students else None,
+                show_competition_overlay,
+                visible_competition,
+                use_zones=use_zones_flag,
+                map_style=st.session_state.get('map_style', 'open-street-map'),
+                show_student_heatmap=st.session_state.get('show_student_heatmap', False),
+                student_heatmap_radius=st.session_state.get('student_heatmap_radius', 15)
             )
             st.plotly_chart(fig, width='stretch')
         else:
@@ -1925,6 +2326,23 @@ def main():
                 top_hpfi['hpfi'] = top_hpfi['hpfi'].map(lambda v: f"{v:.2f}")
                 top_hpfi['income'] = top_hpfi['income'].map(lambda v: f"${v:,.0f}")
                 st.dataframe(top_hpfi, width='stretch')
+        # Add Top Recruitment Targets by RHI
+        if 'recruitment_heat_index' in demographics_filtered.columns:
+            st.divider()
+            st.write('**Top 50 Recruitment Targets (RHI)**')
+            top_targets = demographics_filtered.sort_values('recruitment_heat_index', ascending=False).head(50)[[
+                'block_group_id', 'recruitment_heat_index', 'hpfi', 'EDI', 'crime_norm', 'transit_norm', 'vacancy_norm', 'gini_norm', 'nearest_campus_km', 'k12_pop', 'income', 'faith_norm'
+            ]].copy()
+            if not top_targets.empty:
+                top_targets['recruitment_heat_index'] = top_targets['recruitment_heat_index'].map(lambda v: f"{v:.1f}")
+                top_targets['hpfi'] = top_targets['hpfi'].map(lambda v: f"{v:.2f}")
+                top_targets['EDI'] = top_targets['EDI'].map(lambda v: f"{v:.1f}")
+                top_targets['income'] = top_targets['income'].map(lambda v: f"${v:,.0f}")
+                top_targets['k12_pop'] = top_targets['k12_pop'].map(lambda v: f"{int(v):,}")
+                st.dataframe(top_targets, use_container_width=True)
+                # Offer Copy/Download of block group list
+                id_list = '\n'.join(top_targets['block_group_id'].astype(str).tolist())
+                st.download_button('Copy Block Group IDs', id_list, file_name='top_recruitment_targets.txt', mime='text/plain')
         
         # Export option
         st.subheader("📥 Export Data")
