@@ -55,6 +55,8 @@ def compute_edi_block_groups(
     *,
     catchment_km: float = 15.0,
     beta_km: float = 5.0,
+    decay_type: str = 'exponential',  # 'exponential', 'gaussian', 'linear', 'fixed'
+    decay_param: float | None = None,
     need_weights: tuple = (0.7, 0.3),  # poverty, <HS
     comp_weights: tuple = (0.40, 0.30, 0.20, 0.10),  # access, ratio, need, infra
     include_school_types: tuple = None,
@@ -135,9 +137,23 @@ def compute_edi_block_groups(
     
     within_catchment = D <= catchment_km
     
-    # --- Gravity weights: w(d) = exp(-d / beta) ---
-    # Schools outside catchment get zero weight
-    W = np.exp(-D / beta_km) * within_catchment
+    # --- Gravity weights: multiple decay options ---
+    # Schools outside catchment get zero weight, regardless of decay
+    param = beta_km if decay_param is None else decay_param
+    if decay_type == 'exponential':
+        W = np.exp(-D / param) * within_catchment
+    elif decay_type == 'gaussian':
+        # sigma = param, w(d) = exp(- (d/sigma)^2 )
+        W = np.exp(- (D / param) ** 2) * within_catchment
+    elif decay_type == 'linear':
+        # w(d) = max(0, 1 - d / param)
+        W = np.clip(1.0 - (D / param), 0.0, 1.0) * within_catchment
+    elif decay_type == 'fixed':
+        # w(d) = 1.0 inside param radius, 0 otherwise
+        W = (D <= param).astype(float) * within_catchment
+    else:
+        # Default exponential if unknown
+        W = np.exp(-D / param) * within_catchment
     
     # --- School supply (seats) ---
     # Prefer capacity, else enrollment, else median by type, else global median

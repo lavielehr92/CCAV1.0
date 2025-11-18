@@ -694,6 +694,25 @@ Push to GitHub and the dashboard auto-updates.
 - ✅ Fixed competition schools map rendering errors
 - ✅ Removed first-generation college metrics (not available in ACS)
 
+## 🔄 External Data & Ingestion
+
+The dashboard can optionally incorporate additional external layers that help inform the Recruitment Heat Index (RHI) and other analytics. For details and usage instructions, see `INGEST.md` and `data/external/README.md`.
+
+- Vacancy data (property level)
+- Crime incidents (point-level)
+- Public transit stops (SEPTA)
+- Food / grocery access (retail food stores)
+- Gini inequality by block group (Census B19083)
+- HUD-assisted properties
+
+Run the ingestion script to aggregate these external datasets to block-group totals compatible with the app:
+
+```powershell
+python scripts\ingest\ingest_external_layers.py --census-key <YOUR_CENSUS_API_KEY>
+```
+
+The ingestion script outputs CSVs under `data/external/`. If you plan to use the GitHub Actions workflow to update external layers automatically, add your `CENSUS_API_KEY` to the GitHub repository secrets and enable the `update_external_layers` workflow.
+
 ### **v1.0 (Initial Release)**
 - Basic HPFI calculation (income, poverty, K-12, EDI)
 - Simple distance-based EDI

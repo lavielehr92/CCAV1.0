@@ -146,6 +146,15 @@ python fetch_block_groups_live.py
 
 # Enhance K-12 estimates
 python fetch_enhanced_k12_data.py
+
+# Optional: fetch & aggregate external layers (vacancy, crime, transit, food, gini, HUD)
+python scripts\ingest\ingest_external_layers.py --census-key <YOUR_CENSUS_API_KEY>
+```
+
+# Cleanup unneeded legacy files
+```powershell
+python scripts\maintenance\clean_unnecessary_files.py  # interactive
+python scripts\maintenance\clean_unnecessary_files.py --force  # non-interactive
 ```
 
 ### Run Dashboard

@@ -297,6 +297,32 @@ Enable:
 sudo ln -s /etc/nginx/sites-available/philly-edu /etc/nginx/sites-enabled/
 sudo nginx -t
 sudo systemctl restart nginx
+
+## Automated Update of External Layers (CI)
+
+You can enable an automated workflow to fetch external data layers and persist them to the repository. A GitHub Actions workflow (`.github/workflows/update_external_layers.yml`) is included and runs on demand or on a daily schedule.
+
+1. Add a repository secret `CENSUS_API_KEY` (Settings → Secrets → Actions) with your Census API key.
+2. Trigger the workflow manually via 'Actions' → 'Update external layers' → 'Run workflow', or let it run on a schedule.
+3. The workflow will run `scripts/ingest/ingest_external_layers.py` and commit any changed CSVs under `data/external/`.
+
+Note: If you prefer not to have CI commit data into the repo, leave the workflow disabled and run ingestion locally.
+
+### Clean up local and legacy files
+
+The repository includes a maintenance script that lists and optionally deletes legacy files that are no longer needed. Review the `scripts/maintenance/clean_unnecessary_files.py` list before running.
+
+To run interactively:
+
+```powershell
+python scripts/maintenance/clean_unnecessary_files.py
+```
+
+To run non-interactively (force deletion):
+
+```powershell
+python scripts/maintenance/clean_unnecessary_files.py --force
+```
 ```
 
 ## Data Update Strategy
