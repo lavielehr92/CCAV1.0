@@ -6,7 +6,10 @@ CCA Expansion Analysis Dashboard with Choropleth Visualization
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import geopandas as gpd
+try:
+    import geopandas as gpd
+except Exception:
+    gpd = None
 import json
 from typing import Dict
 import os
@@ -14,6 +17,7 @@ from pathlib import Path
 import requests
 from typing import Tuple
 from educational_desert_index_bg import compute_edi_block_groups, haversine_km
+from scripts.utils.data_quality import compute_legitimate_flag as compute_legitimate_flag_module
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 try:
@@ -525,6 +529,9 @@ def ensure_block_group_id(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# compute_legitimate_flag is provided by the helper module: scripts.utils.data_quality.compute_legitimate_flag
+
+
 # Page config
 st.set_page_config(
     page_title="CCA Growth Opportunity Explorer", 
@@ -772,6 +779,8 @@ def load_block_group_data():
         demographics = demographics
 
     demographics = ensure_block_group_id(demographics)
+    # Add 'is_legit' flag for each block group (valid coordinates, population, income, k12)
+    demographics = compute_legitimate_flag_module(demographics)
     return gdf, demographics, demos_summary
 
 @st.cache_data  
@@ -873,6 +882,7 @@ def create_choropleth_map(
                     feature['properties'][color_column] = str(color_val) if pd.notna(color_val) else 'Unknown'
                 else:
                     feature['properties'][color_column] = 0.0 if pd.isna(color_val) else float(color_val)
+            feature['properties']['is_legit'] = bool(row.get('is_legit', False))
     
     # Build custom hover template with proper formatting for missing data
     hover_template = '<b>Block Group: %{customdata[0]}</b><br>'
@@ -882,7 +892,8 @@ def create_choropleth_map(
     hover_template += 'Median Income: %{customdata[2]}<br>'
     hover_template += 'K-12 Population: %{customdata[3]}<br>'
     hover_template += 'HPFI: %{customdata[4]}<br>'
-    hover_template += 'RHI: %{customdata[5]}<extra></extra>'
+    hover_template += 'RHI: %{customdata[5]}<br>'
+    hover_template += 'Validated Data: %{customdata[7]}<extra></extra>'
     
     # Prepare custom data for hover with proper formatting
     cleaned = plot_data.copy()
@@ -971,6 +982,7 @@ def create_choropleth_map(
             format_value(row, 'hpfi', 'hpfi'),
             format_value(row, 'recruitment_heat_index', 'number') if 'recruitment_heat_index' in row.index else 'N/A',
             zone_val,
+            'Yes' if bool(row.get('is_legit', False)) else 'No'
         ])
 
     customdata = np.array(customdata_list)
@@ -1017,6 +1029,14 @@ def create_choropleth_map(
         colorbar=colorbar,
         showscale=True
     )
+
+    # Add a small color/legend box indicating quantiles for the color column (when not using zones)
+    if not use_zones:
+        try:
+            q10, q50, q90 = np.nanpercentile(cleaned[color_column].dropna().astype(float).values, [10, 50, 90])
+            st.markdown(f"**Legend ({color_column}):** Min: {np.nanmin(cleaned[color_column]):.2f} • 10th: {q10:.2f} • Median: {q50:.2f} • 90th: {q90:.2f} • Max: {np.nanmax(cleaned[color_column]):.2f}")
+        except Exception:
+            pass
 
     # Optional overlays for new layers - use lower opacity choropleth for contextual layers
     if show_vacancy_layer and 'vacancy_norm' in cleaned.columns:
@@ -1391,6 +1411,11 @@ def main():
         <p style='margin: 0.5rem 0 0 0; opacity: 0.9;'>Identify high-potential areas to broaden CCA's reach across diverse socioeconomic groups and support balanced, inclusive growth. Data from ACS 2023.</p>
     </div>
     """, unsafe_allow_html=True)
+    # Quick How-to box for users
+    with st.container():
+        st.info(
+            "How to use the dashboard: 1) Ensure Presentation Mode is ON for professional view; 2) Set Geographic Scope (default 15km); 3) Set Income & HPFI thresholds to focus; 4) Toggle map layers; 5) For crime, set date range and click 'Fetch Crime Data'; 6) Export filtered results via 'Download Filtered Data as CSV'."
+        )
     
     # Add explanation of EDI in an expandable section
     with st.expander("ℹ️ Understanding the Educational Desert Index (EDI)"):
@@ -1458,6 +1483,15 @@ def main():
     bg_cache_ts = k12_summary.get('bg_cache_timestamp', 'N/A')
     tract_cache_ts = k12_summary.get('tract_cache_timestamp', 'N/A')
 
+    # Compute 'legit' derived counts to display: use only rows flagged is_legit
+    try:
+        legit_demographics = demographics[demographics['is_legit']].copy()
+        legit_total_students = float(legit_demographics['k12_pop'].sum()) if 'k12_pop' in legit_demographics.columns else float('nan')
+        legit_block_groups_count = len(legit_demographics)
+    except Exception:
+        legit_total_students = total_students_loaded
+        legit_block_groups_count = total_block_groups_loaded
+
     # Load school data
     try:
         competition_schools = load_competition_schools()
@@ -1515,14 +1549,19 @@ def main():
     
     with st.sidebar.expander("📊 Market Overview", expanded=True):
         st.metric(
-            "Total K-12 Students",
-            f"{total_students_loaded:,.0f}",
-            help="ACS 2023 modeled enrollment across Philadelphia block groups"
+            "Total K-12 Students (valid data)",
+            f"{legit_total_students:,.0f}",
+            help="ACS 2023 modeled enrollment across Philadelphia block groups — only block groups with valid demographic data"
         )
+        if total_students_loaded != legit_total_students:
+            st.caption(f"Raw total (including imputed/invalid rows): {total_students_loaded:,.0f}")
         st.metric(
             "Block Groups Analyzed",
-            f"{total_block_groups_loaded:,}"
+            f"{legit_block_groups_count:,}",
+            help="Number of block groups with valid data shown by default"
         )
+        if total_block_groups_loaded != legit_block_groups_count:
+            st.caption(f"Raw block groups loaded: {total_block_groups_loaded:,}")
         
         if student_per_public_seat is not None:
             st.metric(
@@ -1532,6 +1571,8 @@ def main():
             )
         
         st.caption(f"📅 Data: ACS 2023 | Updated {bg_cache_ts[:10]}")
+        # Presentation / Professional Mode toggle (enforced default True to hide imputed or incomplete data in presentation)
+        presentation_mode = st.checkbox("Presentation Mode: Professional (hide imputed/incomplete data)", value=True, help='Enable to ensure only validated data is shown. Removes imputed/invalid rows from KPIs and maps.')
     
     # Data Quality Details (collapsible)
     with st.sidebar.expander("📋 Data Quality & Technical Details"):
@@ -1639,6 +1680,111 @@ def main():
             ]
             st.caption(f"✓ Showing incomes from ${income_range[0]:,} to ${income_range[1]:,}")
 
+        # Map Layer Controls (moved earlier for clarity)
+        with st.sidebar.expander("🗺️ **Map Layers**", expanded=False):
+            show_current_students = st.checkbox(
+                "Show Current Student Locations", 
+                value=False,
+                help="Overlay current CCA student addresses"
+            )
+            highlight_premium = st.checkbox("Highlight Premium Growth Targets", value=True, help="Overlay a visual highlight on Premium Growth Target block groups", key='highlight_premium')
+            show_vacancy_layer = st.checkbox('Show Vacancy Layer', value=False, key='show_vacancy_layer')
+            show_crime_layer = st.checkbox('Show Crime Layer', value=False, key='show_crime_layer')
+            # Crime date range and fetch controls - allow live fetch using Carto SQL
+            with st.expander("🕒 Crime Date Range & Fetch"):
+                default_end = pd.Timestamp.utcnow().date()
+                default_start = default_end - pd.Timedelta(days=30)
+                crime_start = st.date_input('Crime Start Date', default_start)
+                crime_end = st.date_input('Crime End Date', default_end)
+                crime_format = st.selectbox('Crime Fetch Format', options=['geojson', 'csv'], index=0)
+                if st.button('Fetch Latest Crime Data (Carto)'):
+                    # Build SQL and fetch
+                    try:
+                        from scripts.ingest.ingest_external_layers import build_cartosql_url
+                        sql = (
+                            "SELECT *, ST_Y(the_geom) AS lat, ST_X(the_geom) AS lon "
+                            "FROM incidents_part1_part2 "
+                            f"WHERE dispatch_date_time >= '{crime_start} 00:00:00' "
+                            f"AND dispatch_date_time < '{crime_end} 23:59:59'"
+                        )
+                        url = build_cartosql_url(sql, fmt=crime_format)
+                        with st.spinner("Fetching crime data... this may take a few seconds"):
+                            resp = requests.get(url, timeout=60)
+                            resp.raise_for_status()
+                            if crime_format == 'geojson':
+                                payload = resp.json()
+                                points = []
+                                for f in payload.get('features', []):
+                                    props = f.get('properties', {})
+                                    geom = f.get('geometry') or {}
+                                    # ST_X/ST_Y should already have been added; try both
+                                    lat = props.get('lat') or (geom.get('coordinates')[1] if geom.get('coordinates') else None)
+                                    lon = props.get('lon') or (geom.get('coordinates')[0] if geom.get('coordinates') else None)
+                                    if lat and lon:
+                                        points.append({'lat': lat, 'lon': lon})
+                            else:
+                                df = pd.read_csv(io.StringIO(resp.text))
+                                points = []
+                                if 'latitude' in df.columns and 'longitude' in df.columns:
+                                    for _, r in df.iterrows():
+                                        try:
+                                            lat = r['latitude']
+                                            lon = r['longitude']
+                                            points.append({'lat': lat, 'lon': lon})
+                                        except Exception:
+                                            pass
+                        # Convert points to GeoDataFrame and aggregate
+                        if 'points' in locals() and points:
+                            pts_df = pd.DataFrame(points)
+                            try:
+                                import geopandas as gpd
+                                pts_gdf = gpd.GeoDataFrame(pts_df, geometry=gpd.points_from_xy(pts_df['lon'], pts_df['lat']), crs='EPSG:4326')
+                                bg_gdf = gdf[['GEOID', 'geometry']].copy()
+                                bg_gdf['block_group_id'] = bg_gdf['GEOID'].astype(str)
+                                joined = gpd.sjoin(bg_gdf, pts_gdf, how='left', predicate='intersects')
+                                agg = joined.groupby('block_group_id').size().reset_index(name='crimes')
+                                # Merge population & compute crimes per 1k
+                                demo = demographics.set_index('block_group_id')
+                                agg['total_pop'] = agg['block_group_id'].map(demo['total_pop']).fillna(0)
+                                agg['crimes_per_1k'] = agg.apply(lambda r: (r['crimes']/r['total_pop']*1000) if r['total_pop']>0 else 0, axis=1)
+                                # Write CSV to data/external
+                                ex_path = EXTERNAL_DATA_DIR / 'crime_per_block_group.csv'
+                                agg[['block_group_id', 'crimes_per_1k']].to_csv(ex_path, index=False)
+                                st.success('Crime data fetched and aggregated to block groups. The map will refresh.')
+                            except Exception as exc:
+                                st.error(f'Failed to aggregate crime data: {exc}')
+                    except Exception as exc:
+                        st.error(f'Crime fetch failed: {exc}')
+            show_transit_layer = st.checkbox('Show Transit Layer', value=False, key='show_transit_layer')
+            show_food_layer = st.checkbox('Show Food Access Layer', value=False, key='show_food_layer')
+            show_hud_layer = st.checkbox('Show HUD Zones Layer', value=False, key='show_hud_layer')
+            show_competition_overlay = st.checkbox(
+                "Show Other Educational Options", 
+                value=True,
+                help="Display charter, private, and Catholic schools"
+            )
+
+            if not competition_schools.empty:
+                type_options = sorted(competition_schools['type'].dropna().unique())
+            else:
+                type_options = []
+            selected_competition_types = st.multiselect(
+                "School Types to Display",
+                options=type_options,
+                default=type_options,
+                help="Select which types of schools to show"
+            ) if type_options else []
+
+            include_competitors_in_edi = st.checkbox(
+                "Include Other Schools in EDI Calculation",
+                value=False,
+                help="Adds charter/private capacity to EDI supply"
+            )
+            if include_competitors_in_edi:
+                st.caption("✓ EDI includes all school seats")
+            else:
+                st.caption("EDI uses CCA/public seats only")
+
         # HPFI Focus
         with st.sidebar.expander("🎯 **High-Potential Focus**", expanded=False):
             highlight_hpfi = st.checkbox(
@@ -1706,40 +1852,21 @@ def main():
             )
             decay_param = st.slider("Decay Parameter (km)", min_value=1.0, max_value=25.0, value=5.0, step=0.5, help="Beta or radius parameter for the selected decay function")
             catchment_km = st.slider("Catchment Radius (km)", min_value=5, max_value=50, value=15, step=1, help="Max distance to consider schools for EDI calculations")
+
+            # Include imputed/missing data toggle — default False to show only legitimate data
+            if presentation_mode:
+                include_non_legit = False
+                st.caption("Presentation Mode is ON: imputed/incomplete data is hidden for professional use.")
+            else:
+                include_non_legit = st.checkbox("Include imputed / incomplete data", value=False, help="If checked, include block groups with missing or flagged data in visuals (not recommended for production)")
+            if include_non_legit:
+                st.caption("⚠️ Including imputed / incomplete data may show unreliable figures")
         
     else:
         st.info("📍 No block groups found within the specified radius. Try expanding your geographic scope.")
         demographics_filtered = demographics.iloc[0:0]
         
-    # Map Layer Controls
-    with st.sidebar.expander("🗺️ **Map Layers**", expanded=False):
-        show_current_students = st.checkbox(
-            "Show Current Student Locations", 
-            value=False,
-            help="Overlay current CCA student addresses"
-        )
-        highlight_premium = st.checkbox("Highlight Premium Growth Targets", value=True, help="Overlay a visual highlight on Premium Growth Target block groups", key='highlight_premium')
-        show_vacancy_layer = st.checkbox('Show Vacancy Layer', value=False, key='show_vacancy_layer')
-        show_crime_layer = st.checkbox('Show Crime Layer', value=False, key='show_crime_layer')
-        show_transit_layer = st.checkbox('Show Transit Layer', value=False, key='show_transit_layer')
-        show_food_layer = st.checkbox('Show Food Access Layer', value=False, key='show_food_layer')
-        show_hud_layer = st.checkbox('Show HUD Zones Layer', value=False, key='show_hud_layer')
-        show_competition_overlay = st.checkbox(
-            "Show Other Educational Options", 
-            value=True,
-            help="Display charter, private, and Catholic schools"
-        )
-        
-        if not competition_schools.empty:
-            type_options = sorted(competition_schools['type'].dropna().unique())
-        else:
-            type_options = []
-        selected_competition_types = st.multiselect(
-            "School Types to Display",
-            options=type_options,
-            default=type_options,
-            help="Select which types of schools to show"
-        ) if type_options else []
+    # Map Layer Controls are shown in the Geographic/Income filter section above
 
         include_competitors_in_edi = st.checkbox(
             "Include Other Schools in EDI Calculation",
@@ -1774,6 +1901,13 @@ def main():
         
         📧 Questions? Contact your data team.
         """)
+        st.write("**Layer definitions (Normalized to 0–1 where shown):**")
+        st.write("- `vacancy_norm`: Higher => more vacant properties (derived from vacant_pct).")
+        st.write("- `crime_norm`: Higher => safer (1 - normalized(crimes_per_1k)).")
+        st.write("- `transit_norm`: Higher => better transit access (normalized stop count).")
+        st.write("- `food_access_norm`: Higher => better access to grocery / food stores.")
+        st.write("- `gini_norm`: Higher => higher inequality.")
+        st.write("- `hud_presence`: 1 if HUD-assisted property present else 0.")
 
     # Scoring Weights control - keep compact and resettable
     with st.sidebar.expander("⚖️ Scoring Weights", expanded=False):
@@ -1841,10 +1975,13 @@ def main():
 
     # Compute global EDI and HPFI before applying additional filters so scores remain comparable
     demographics = ensure_block_group_id(demographics.copy())
+    # Ensure 'is_legit' is present and normalized
+    if 'is_legit' not in demographics.columns:
+        demographics = compute_legitimate_flag_module(demographics)
 
     if not edi_supply_df.empty:
         with st.spinner("Calculating Educational Desert Index across all block groups..."):
-            demographics_for_edi = demographics[demographics['total_pop'] > 0].copy()
+            demographics_for_edi = demographics[(demographics['total_pop'] > 0) & (demographics.get('is_legit', False) == True)].copy()
             if not demographics_for_edi.empty:
                 edi_full_df = compute_edi_block_groups(
                     demographics_for_edi, edi_supply_df,
@@ -1870,7 +2007,18 @@ def main():
         demographics['EDI'] = 0.0
 
     demographics = demographics.drop(columns=['hpfi', 'nearest_campus_km'], errors='ignore')
-    demographics = compute_hpfi_scores(demographics, edi_col="EDI", weights=st.session_state.get('hpfi_weights'))
+    # Compute HPFI only on legitimate rows (presentation mode compliance)
+    try:
+        hpfi_df = demographics[demographics['is_legit'] == True].copy()
+        if not hpfi_df.empty:
+            hpfi_df = compute_hpfi_scores(hpfi_df, edi_col="EDI", weights=st.session_state.get('hpfi_weights'))
+            # Remove any existing hpfi column and merge back
+            demographics['hpfi'] = np.nan
+            demographics.loc[hpfi_df.index, 'hpfi'] = hpfi_df['hpfi'].values
+        else:
+            demographics['hpfi'] = np.nan
+    except Exception:
+        demographics['hpfi'] = 0.0
     hpfi_global_75 = float(demographics['hpfi'].quantile(0.75)) if not demographics['hpfi'].empty else 0.75
 
     edi_zone_df = compute_edi_hpfi_zones(demographics, edi_col="EDI", hpfi_col="hpfi")
@@ -1895,9 +2043,13 @@ def main():
     # Compute Recruitment Heat Index (RHI)
     try:
         rhi_weights = st.session_state.get('rhi_weights', {k: v for k, v in WEIGHT_DEFAULTS.items() if k.startswith('rhi')})
-        demographics['recruitment_heat_index'] = compute_recruitment_heat_index(demographics, rhi_weights, current_students)
-    except Exception as exc:
-        demographics['recruitment_heat_index'] = 0
+        # Compute RHI only for legitimate rows
+        rhi_df = demographics[demographics['is_legit'] == True].copy()
+        rhi_df['recruitment_heat_index'] = compute_recruitment_heat_index(rhi_df, rhi_weights, current_students)
+        demographics['recruitment_heat_index'] = np.nan
+        demographics.loc[rhi_df.index, 'recruitment_heat_index'] = rhi_df['recruitment_heat_index'].values
+    except Exception:
+        demographics['recruitment_heat_index'] = np.nan
 
     metrics_cols = ['block_group_id', 'EDI', 'hpfi', 'nearest_campus_km', 'zone', 'marketing_zone', 'marketing_priority']
     metric_only_cols = [col for col in metrics_cols if col != 'block_group_id']
@@ -1970,7 +2122,7 @@ def main():
             if not edi_supply_df.empty:
                 with st.spinner("Calculating Educational Desert Index..."):
                     try:
-                        demographics_with_pop = demographics_filtered[demographics_filtered['total_pop'] > 0].copy()
+                        demographics_with_pop = demographics_filtered[(demographics_filtered['total_pop'] > 0) & (demographics_filtered.get('is_legit', False) == True)].copy()
                         if not demographics_with_pop.empty:
                             edi_df = compute_edi_block_groups(
                                 demographics_with_pop, edi_supply_df,
@@ -2026,6 +2178,18 @@ def main():
         demographics_filtered['first_gen_pct'] = pd.to_numeric(demographics_filtered['%first_gen'], errors='coerce')
     else:
         demographics_filtered['first_gen_pct'] = pd.to_numeric(demographics_filtered.get('first_gen_pct'), errors='coerce')
+
+    # Exclude imputed/incomplete data unless user opts in
+    try:
+        if not include_non_legit:
+            before_count = len(demographics_filtered)
+            if 'is_legit' in demographics_filtered.columns:
+                demographics_filtered = demographics_filtered[demographics_filtered['is_legit'] == True].copy()
+            removed = before_count - len(demographics_filtered)
+            if removed > 0:
+                st.caption(f"✓ Excluded {removed} block groups due to missing/invalid demographic fields (use 'Include imputed / incomplete data' to include them)")
+    except Exception:
+        pass
     
 
     hpfi_threshold = None
@@ -2233,6 +2397,19 @@ def main():
                 color_col = color_options.get(selected_metric, 'k12_pop')
                 use_zones_flag = False
             
+            # Methodology & Equations (short summary for users)
+            with st.expander('📐 Methodology & Equations (short)'):
+                st.markdown('''
+                **HPFI (High-Potential Family Index)** — weighted 0–1 score for tuition-paying potential:
+
+                HPFI = w_income * income_norm + w_inverse_poverty * inverse_poverty_norm + w_proximity * proximity_norm + w_christian * christian_norm + w_k12 * k12_norm + w_inverse_edi * inverse_edi
+
+                **EDI (Educational Desert Index)** — 0–100 index: combination of access, supply/demand ratio, distance barriers, and socioeconomic need via a 2SFCA calculation.
+
+                **RHI (Recruitment Heat Index)** — normalized index combining premium potential, transit access, crime (inverted), vacancy, gini inequality, student proximity & faith alignment.
+
+                All component inputs are normalized to 0–1 by min-max scaling before weighting. Crime is inverted (1 - normalized(crime_per_1k)) to convert higher crime to lower safety.
+                ''')
             fig = create_choropleth_map(
                 gdf_filtered,
                 demographics_filtered,

@@ -690,6 +690,12 @@ Push to GitHub and the dashboard auto-updates.
 - ✅ Enhanced marketing zone scoring with 3-tier Christian % classification
 - ✅ Reorganized sidebar for production readiness
 - ✅ Implemented rigorous 2SFCA for EDI calculation
+## Data Validity and Filters
+
+By default the dashboard shows only block groups with **legitimate** data (valid coordinates, population, income, and modeled or raw K-12 counts). You can include imputed or incomplete block groups using the 'Include imputed / incomplete data' toggle in the sidebar under **Refinement Options**.
+
+This reduces risk of misleading statistics from records lacking core demographic values. If you need full raw coverage, toggle the option but treat summary KPIs as including imputed values.
+
 - ✅ Added campus proximity to HPFI (13% weight)
 - ✅ Fixed competition schools map rendering errors
 - ✅ Removed first-generation college metrics (not available in ACS)
